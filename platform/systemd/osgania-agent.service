@@ -1,0 +1,36 @@
+[Unit]
+Description=OSGANIA client agent (headless Claude Code run)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=aios
+Group=aios
+WorkingDirectory=/opt/osgania/client
+StateDirectory=osgania-agent
+StateDirectoryMode=0700
+Environment=DISABLE_AUTOUPDATER=1
+Environment=HOME=%S/osgania-agent
+Environment=XDG_CONFIG_HOME=%S/osgania-agent
+Environment=XDG_CACHE_HOME=%S/osgania-agent
+Environment=XDG_DATA_HOME=%S/osgania-agent
+Environment=XDG_STATE_HOME=%S/osgania-agent
+LoadCredential=anthropic-api-key:/etc/osgania/secrets/anthropic-api-key
+UnsetEnvironment=ANTHROPIC_AUTH_TOKEN
+ExecStart=/opt/osgania/platform/bin/agent-run.sh -p
+ProtectSystem=strict
+ReadWritePaths=/opt/osgania/client /var/log/osgania
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+LimitCORE=0
+SystemCallFilter=~@reboot @swap @mount @clock @debug @module @raw-io @obsolete

@@ -1,0 +1,98 @@
+schema: spec-driven
+initialized: 2026-06-14
+project: osgania
+artifact_store:
+  mode: openspec
+
+context: |
+  Product: OSGANIA — one VPS per client, each running a dedicated Claude Code CLI agent.
+  Stack: bash hooks (guardia.sh, camara.sh), provision.sh, systemd timers, JSON (managed-settings.json),
+         YAML (intake.yaml). Onboarding generator language: TBD (Python or Node — open decision).
+  Architecture: platform/ (operator layer, read-only to agent) + client/ (per-client context, generated from intake.yaml).
+  Secrets: never in versioned files; managed via managed-settings.json with Read() denied on secrets path.
+  Isolation: one API key per client workspace, spend limit as cost ceiling, key revocation = kill switch.
+
+non_negotiable_principles:
+  - Per-client isolation (one VPS, one API key, one workspace per client)
+  - Client-facing agent has NO root and is read-only by default
+  - Brain vs apps separation (Claude Code connects to Supabase/n8n via least-privilege MCP tokens)
+  - Secrets never in versioned files, repo, or conversation
+  - Operator policy (managed-settings.json) cannot be overridden by the client/agent
+  - Audit log of every action (camara.sh PostToolUse hook)
+  - Verify product facts against official docs; never guess
+
+strict_tdd: true
+
+testing:
+  test_runner:
+    bash:
+      available: false
+      framework: bats-core
+      install: brew install bats-core
+      command: bats tests/
+    python:
+      available: false
+      framework: pytest
+      install: pip install pytest
+      command: python3 -m pytest
+    node:
+      available: true
+      framework: TBD (jest / vitest)
+      node_version: "26.0.0"
+      npm_version: "11.12.1"
+  lint:
+    shellcheck:
+      available: false
+      install: brew install shellcheck
+      command: shellcheck scripts/**/*.sh
+    jq:
+      available: true
+      version: "1.7.1"
+  python3:
+    available: true
+    version: "3.9.6"
+
+  canonical:
+    test_command: "bats tests/"
+    lint_command: "shellcheck scripts/**/*.sh"
+    note: |
+      bats-core and shellcheck are NOT yet installed on this dev machine.
+      Run: brew install bats-core shellcheck
+      Until installed, tests and linting cannot run. Install before first sdd-apply.
+
+rules:
+  proposal:
+    - Include rollback plan for changes touching managed-settings.json or secrets paths
+    - Reference non-negotiable principles when relevant
+  specs:
+    - Use Given/When/Then for behavioral scenarios
+    - Use RFC 2119 keywords (MUST, SHALL, SHOULD, MAY)
+    - Explicitly state isolation boundary for every feature
+  design:
+    - Include sequence diagrams for agent-to-app communication flows
+    - Document architecture decisions with rationale and alternatives considered
+    - Flag every place where secrets could leak
+  tasks:
+    - Group by phase, use hierarchical numbering
+    - Keep tasks completable in one session
+    - Every bash task must have a paired shellcheck lint task
+  apply:
+    tdd: true
+    test_command: "bats tests/"
+    lint_command: "shellcheck scripts/**/*.sh"
+    note: Install bats-core and shellcheck before first apply run
+  verify:
+    test_command: "bats tests/"
+    lint_command: "shellcheck scripts/**/*.sh"
+    build_command: ""
+    coverage_threshold: 0
+  archive:
+    - Warn before merging destructive deltas
+    - Archive includes audit trail of all agent-touching scripts
+
+open_decisions:
+  - id: OD-001
+    topic: Onboarding generator language
+    options: [Python, Node]
+    status: open
+    notes: Decide in design phase. Python has simpler deployment; Node aligns with existing n8n skills.

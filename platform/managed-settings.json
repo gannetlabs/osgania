@@ -1,0 +1,42 @@
+{
+  "permissions": {
+    "defaultMode": "default",
+    "deny": [
+      "Bash(sudo *)",
+      "Bash(curl *)",
+      "Bash(wget *)",
+      "Read(/etc/osgania/secrets/**)",
+      "Edit(/opt/osgania/platform/**)",
+      "Write(/opt/osgania/platform/**)"
+    ],
+    "allow": [],
+    "disableBypassPermissionsMode": "disable"
+  },
+  "allowManagedHooksOnly": true,
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/opt/osgania/platform/hooks/guardia.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/opt/osgania/platform/hooks/camara.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

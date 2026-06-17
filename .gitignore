@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+
+# Local SDD / skill-registry tooling state (machine-local)
+.atl/
+
+# Secrets — NEVER commit. Secrets live root-owned on the VPS, not in the repo.
+# (Defense in depth: principle #4 — secrets never in versioned files.)
+*.key
+*.pem
+*.env
+.env
+.env.*
+secrets/
+**/secrets/
+anthropic-api-key
+*.bak
