@@ -218,7 +218,10 @@ report_plan() {
     printf '\n[Step 4] Launch wrapper install:\n'
     printf '  - install -o root -g root -m 0755 platform/bin/agent-run.sh %s\n' \
         "$AGENT_WRAPPER_INSTALLED"
-    printf '  - Lint the wrapper: execs /usr/bin/claude "$@", contains no --bare\n'
+    printf '  - Lint the wrapper (2b): canonical exec line present, no --bare\n'
+    printf '\n[Step 4b] Prompt file install (HB-01.4):\n'
+    printf '  - install -d -o root -g root -m 0755 /opt/osgania/platform/prompts/\n'
+    printf '  - install -o root -g root -m 0644 platform/prompts/agent-prompt.txt /opt/osgania/platform/prompts/agent-prompt.txt\n'
     printf '\n[Step 5] managed-settings.json verify (READ-ONLY — no write, post-pivot):\n'
     printf '  - Validate JSON; assert R9-R12 structural invariant present + unchanged\n'
     printf '  - 2a adds NO apiKeyHelper key and writes NOTHING to the policy\n'
@@ -335,18 +338,35 @@ create_workspace() {
 # ---------------------------------------------------------------------------
 # _assert_wrapper_invariant <wrapper_src>
 #
-# Load-bearing --bare guard on the WRAPPER (spec HA-05.4 / HA-06.2): the wrapper
-# MUST exec /usr/bin/claude "$@" and MUST NOT contain a --bare token. Aborts if
-# violated. Mirrors the unit-string guard in build_service_unit.
+# Load-bearing guards on the WRAPPER (spec HB-01.3, HB-01.6, HB-01.7):
+#   - MUST NOT contain a --bare token (HB-01.6 ban, case-insensitive)
+#   - MUST contain the canonical 2b exec line with --permission-mode dontAsk
+#   - MUST NOT contain --bare in the wrapper source
+# Aborts if violated. Mirrors the unit-string guard in build_service_unit.
+# Note: 2b supersedes the 2a "exec /usr/bin/claude \"$@\"" invariant.
 # ---------------------------------------------------------------------------
 _assert_wrapper_invariant() {
     local src="$1"
-    if printf '%s' "$(cat "$src")" | grep -qiE '(^|[[:space:]])(-bare|--bare)([[:space:]]|$)'; then
+    local content
+    content="$(cat "$src")"
+
+    # --bare ban (HB-01.6): case-insensitive
+    if printf '%s' "$content" | grep -qiE '(^|[[:space:]])(-bare|--bare)([[:space:]]|$)'; then
         printf 'provision-agent.sh: INVARIANT ABORT: wrapper %s contains a --bare token — refusing to install\n' "$src" >&2
         return 1
     fi
-    if ! grep -qE '^[[:space:]]*exec[[:space:]]+/usr/bin/claude[[:space:]]+"\$@"[[:space:]]*$' "$src"; then
-        printf 'provision-agent.sh: INVARIANT ABORT: wrapper %s does not exec /usr/bin/claude "$@" — refusing to install\n' "$src" >&2
+
+    # Canonical 2b exec line (HB-01.3): must be present.
+    # Match the fixed token components: the exec, the flags, and the PROMPT_FILE reference.
+    # We check three distinct anchors rather than a single grep with mixed quoting.
+    local exec_check=0
+    printf '%s' "$content" | grep -q 'exec /usr/bin/claude --permission-mode dontAsk -p' && exec_check=1 || true
+    if [[ "$exec_check" -eq 0 ]]; then
+        printf 'provision-agent.sh: INVARIANT ABORT: wrapper %s does not contain the canonical 2b exec line — refusing to install\n' "$src" >&2
+        return 1
+    fi
+    if ! printf '%s' "$content" | grep -q 'PROMPT_FILE'; then
+        printf 'provision-agent.sh: INVARIANT ABORT: wrapper %s does not reference PROMPT_FILE — refusing to install\n' "$src" >&2
         return 1
     fi
 }
@@ -384,6 +404,42 @@ install_wrapper() {
     # wrapper ONLY; a lingering anthropic-key.sh is dead code the deployment must
     # not carry (HA-05-S1). No-op on a fresh box (never installed post-pivot).
     rm -f "$(dirname "$AGENT_WRAPPER_INSTALLED")/anthropic-key.sh"
+}
+
+# ---------------------------------------------------------------------------
+# install_prompt_file
+#
+# Installs platform/prompts/agent-prompt.txt to the canonical target path:
+#   /opt/osgania/platform/prompts/agent-prompt.txt  (root:root 0644)
+# The parent directory is created with install -d (root:root 0755) if absent.
+# The file MUST be outside the agent-writable /opt/osgania/client/ subtree;
+# aios can READ but NOT WRITE the prompt (HB-01.4).
+# Spec: HB-01.4
+# ---------------------------------------------------------------------------
+install_prompt_file() {
+    local canonical_root
+    canonical_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    local repo_root
+    if [[ -n "${PROVISION_TEST_ALLOW_MUTATION:-}" && -n "${REPO_ROOT:-}" ]]; then
+        repo_root="$REPO_ROOT"
+    else
+        repo_root="$canonical_root"
+    fi
+
+    local src="${repo_root}/platform/prompts/agent-prompt.txt"
+    local dest="/opt/osgania/platform/prompts/agent-prompt.txt"
+    local dest_dir
+    dest_dir="$(dirname "$dest")"
+
+    if [[ ! -f "$src" ]]; then
+        printf 'provision-agent.sh: FATAL: prompt template not found: %s\n' "$src" >&2
+        return 1
+    fi
+
+    # Create parent directory (root:root 0755) if absent
+    install -d -o root -g root -m 0755 "$dest_dir"
+    # Install prompt file (root:root 0644 — world-readable, not writable by aios)
+    install -o root -g root -m 0644 "$src" "$dest"
 }
 
 # ---------------------------------------------------------------------------
@@ -582,6 +638,8 @@ build_service_unit() {
 Description=OSGANIA client agent (headless Claude Code run)
 After=network-online.target
 Wants=network-online.target
+After=nftables.service
+Wants=nftables.service
 
 [Service]
 Type=oneshot
@@ -591,6 +649,8 @@ WorkingDirectory=/opt/osgania/client
 StateDirectory=osgania-agent
 StateDirectoryMode=0700
 Environment=DISABLE_AUTOUPDATER=1
+Environment=DISABLE_TELEMETRY=1
+Environment=DISABLE_ERROR_REPORTING=1
 Environment=HOME=%S/osgania-agent
 Environment=XDG_CONFIG_HOME=%S/osgania-agent
 Environment=XDG_CACHE_HOME=%S/osgania-agent
@@ -664,6 +724,8 @@ build_timer_unit() {
     cat <<'TIMER_EOF'
 [Unit]
 Description=OSGANIA agent cadence (PLACEHOLDER — autonomy-ladder owns the real schedule)
+After=nftables.service
+Wants=nftables.service
 
 [Timer]
 OnCalendar=daily
@@ -770,8 +832,14 @@ _classify_bypass_probe() {
 # Spec: HA-09.1, HA-09.2, HA-09.3, HA-09.4
 # ---------------------------------------------------------------------------
 run_defense_in_depth_probe() {
-    local wrapper="$AGENT_WRAPPER_INSTALLED"
-    local claude_bin="${CLAUDE_BIN:-claude}"
+    # JD-6 resolution: the probe MUST invoke /usr/bin/claude DIRECTLY — do NOT route
+    # through agent-run.sh (the 2b wrapper is a production launcher that discards "$@"
+    # and injects --permission-mode dontAsk, destroying both probe oracles:
+    #   - args like --output-format stream-json are DISCARDED → no init event → HB-05.1 BROKEN
+    #   - --permission-mode dontAsk is INJECTED → HB-05.2 VIOLATED
+    # The probe tests the managed-settings layer (disableBypassPermissionsMode:"disable"),
+    # which is entirely independent of the wrapper. Spec: HB-05.2, HB-05.4.
+    local claude_bin="${CLAUDE_BIN:-/usr/bin/claude}"
 
     if [[ ! -f "$AGENT_SECRETS_KEY" ]]; then
         AGENT_PROBE_STATUS="UNVERIFIED"
@@ -784,29 +852,23 @@ run_defense_in_depth_probe() {
         printf 'provision-agent.sh: Defense-in-depth: UNVERIFIED (claude CLI not installed — probe could not run)\n'
         return 0
     fi
-    if [[ ! -x "$wrapper" ]]; then
-        AGENT_PROBE_STATUS="UNVERIFIED"
-        printf 'provision-agent.sh: Defense-in-depth: UNVERIFIED (launch wrapper not installed at %s — probe could not run)\n' "$wrapper"
-        return 0
-    fi
 
     install -d -o aios -g aios -m 0700 "$AGENT_STATE_DIR"
-
-    # Deliver the key the way the systemd unit does: a private creds dir readable
-    # only by aios, mirroring LoadCredential. The wrapper reads $CREDENTIALS_DIRECTORY
-    # and exports ANTHROPIC_API_KEY — the production auth path.
-    local creds_dir
-    creds_dir="$(mktemp -d)"
-    cp "$AGENT_SECRETS_KEY" "${creds_dir}/anthropic-api-key"
-    chown -R aios:aios "$creds_dir"
-    chmod 0700 "$creds_dir"
-    chmod 0400 "${creds_dir}/anthropic-api-key"
 
     # Capture the stream-json init event under --dangerously-skip-permissions and
     # read permissionMode. The benign prompt needs no tool use (the oracle is the
     # init event, not the agent's actions), so model refusal / the CLI bash sandbox
     # / headless permission-deferral cannot confound it. Best-effort; the oracle is
     # the parsed permissionMode, not the exit code.
+    #
+    # JD-6 resolution: export ANTHROPIC_API_KEY inline for the probe invocation ONLY.
+    # The key is stripped of whitespace (same tr pattern as the wrapper) and scoped
+    # to this command via the env-var prefix — it MUST NOT persist in the provisioner
+    # environment after the call. MUST NOT include --permission-mode dontAsk.
+    # Read from AGENT_SECRETS_KEY (persistent on-disk path), NOT CREDENTIALS_DIRECTORY: the provisioner runs outside systemd, so the LoadCredential dir is unset here. Spec HB-05.2.
+    local _probe_key
+    _probe_key="$(tr -d '[:space:]' < "${AGENT_SECRETS_KEY}")"
+
     local out permission_mode
     out="$(runuser -u aios -- env -i \
         HOME="$AGENT_STATE_DIR" \
@@ -814,10 +876,16 @@ run_defense_in_depth_probe() {
         XDG_CACHE_HOME="$AGENT_STATE_DIR" \
         XDG_DATA_HOME="$AGENT_STATE_DIR" \
         XDG_STATE_HOME="$AGENT_STATE_DIR" \
-        CREDENTIALS_DIRECTORY="$creds_dir" \
+        ANTHROPIC_API_KEY="$_probe_key" \
         PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-        "$wrapper" -p --output-format stream-json --verbose --dangerously-skip-permissions 'Reply with the single word: ok' < /dev/null 2> /dev/null || true)"
-    rm -rf "$creds_dir"
+        "$claude_bin" -p \
+            --output-format stream-json \
+            --verbose \
+            --dangerously-skip-permissions \
+            'Reply with the single word: ok' < /dev/null 2> /dev/null || true)"
+    # Clear the local probe key — it MUST NOT persist beyond this point
+    _probe_key=""
+    unset _probe_key
 
     permission_mode="$(printf '%s' "$out" | jq -rs '.[] | select(.type == "system" and .subtype == "init") | .permissionMode' 2> /dev/null | head -1)"
 
@@ -907,6 +975,10 @@ main() {
     # Step 4: Launch wrapper install (post-pivot: replaces the apiKeyHelper)
     printf 'provision-agent.sh: [4/8] installing launch wrapper (agent-run.sh)...\n'
     install_wrapper
+
+    # Step 4b: Install the operator prompt file (HB-01.4 — root-owned, outside client/)
+    printf 'provision-agent.sh: [4b/8] installing prompt file...\n'
+    install_prompt_file
 
     # Step 5: managed-settings.json read-only verify (post-pivot: NO write)
     printf 'provision-agent.sh: [5/8] verifying managed-settings.json (read-only, R9-R12 intact)...\n'

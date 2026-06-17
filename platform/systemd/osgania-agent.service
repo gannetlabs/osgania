@@ -2,6 +2,8 @@
 Description=OSGANIA client agent (headless Claude Code run)
 After=network-online.target
 Wants=network-online.target
+After=nftables.service
+Wants=nftables.service
 
 [Service]
 Type=oneshot
@@ -11,6 +13,8 @@ WorkingDirectory=/opt/osgania/client
 StateDirectory=osgania-agent
 StateDirectoryMode=0700
 Environment=DISABLE_AUTOUPDATER=1
+Environment=DISABLE_TELEMETRY=1
+Environment=DISABLE_ERROR_REPORTING=1
 Environment=HOME=%S/osgania-agent
 Environment=XDG_CONFIG_HOME=%S/osgania-agent
 Environment=XDG_CACHE_HOME=%S/osgania-agent

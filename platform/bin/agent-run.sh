@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
 # /opt/osgania/platform/bin/agent-run.sh — root:root 0755
-# Launch wrapper (ADR-6): source the API key from the systemd LoadCredential
-# tmpfs into ANTHROPIC_API_KEY, then exec the real CLI. The key value never
-# appears in the unit file, the journal, or any versioned file — only in this
-# process's env at runtime (read from $CREDENTIALS_DIRECTORY, a per-unit
-# non-swappable tmpfs). Spec: HA-05.1, HA-05.1a, HA-08.4.
+# Launch wrapper (2b / PRODUCTION LAUNCHER, NOT a transparent pass-through).
+# Sources the API key from the systemd LoadCredential tmpfs into ANTHROPIC_API_KEY,
+# then execs the real CLI with the canonical prompt-file invocation.
+#
+# IMPORTANT (JD-6 / HB-01.3): This wrapper hardcodes the entire claude invocation:
+#   exec /usr/bin/claude --permission-mode dontAsk -p "$(cat "$PROMPT_FILE")"
+# "$@" is NOT forwarded to claude; only the HB-01.8 -p guard checks it.
+# Any caller that needs different claude args (e.g. --output-format stream-json)
+# MUST invoke /usr/bin/claude DIRECTLY — do NOT route through this wrapper.
+#
+# Spec: HA-05.1, HA-05.1a, HA-08.4, HB-01.3, HB-01.4, HB-01.6, HB-01.7, HB-01.8
 set -euo pipefail
 : "${CREDENTIALS_DIRECTORY:?CREDENTIALS_DIRECTORY is not set — agent-run.sh must run under systemd LoadCredential}"
 # Strip ALL whitespace (trailing newline, a CRLF \r from a Windows-pasted key,
@@ -14,4 +20,24 @@ set -euo pipefail
 export ANTHROPIC_API_KEY
 ANTHROPIC_API_KEY="$(tr -d '[:space:]' < "${CREDENTIALS_DIRECTORY}/anthropic-api-key")"
 [[ -n "$ANTHROPIC_API_KEY" ]] || { printf 'agent-run.sh: API key file is empty or whitespace-only\n' >&2; exit 1; }
-exec /usr/bin/claude "$@"
+
+# Canonical prompt file path (HB-01.4): root-owned, outside the agent-writable
+# /opt/osgania/client/ subtree. The agent CAN read but CANNOT write this file.
+PROMPT_FILE="/opt/osgania/platform/prompts/agent-prompt.txt"
+
+# HB-01.8: guard against direct interactive invocation without -p.
+# Iterate over "$@" as standalone positional arguments — do NOT use a $* substring
+# match (which would falsely trigger on a value argument containing the chars "-p").
+_found_p=0
+for _arg in "$@"; do
+    [[ "$_arg" == "-p" ]] && _found_p=1 && break
+done
+if [[ "$_found_p" -eq 0 ]]; then
+    printf 'agent-run.sh: -p argument is required; refusing to exec claude without it\n' >&2
+    exit 1
+fi
+unset _found_p _arg
+
+# Production launch: hardcoded canonical invocation (HB-01.3).
+# --permission-mode dontAsk MUST precede -p so it is not consumed as the prompt value.
+exec /usr/bin/claude --permission-mode dontAsk -p "$(cat "$PROMPT_FILE")"

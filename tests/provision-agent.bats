@@ -437,9 +437,11 @@ STUB
     execstart_line="$(printf '%s' "$unit" | grep '^ExecStart=')"
     [[ "$execstart_line" == "ExecStart=/opt/osgania/platform/bin/agent-run.sh -p" ]] || return 1
 
-    # HA-06.2 also binds on the wrapper: it MUST exec /usr/bin/claude "$@" with no --bare
+    # 2b SUPERSEDES the wrapper exec-"$@" assertion here.
+    # The 2b wrapper is a PRODUCTION LAUNCHER (not transparent pass-through);
+    # its exec form is tested by HB-01-S2. The --bare ban on the wrapper is
+    # tested by HB-01-S2 assertion "does NOT contain --bare".
     local wrapper="${REPO_ROOT_AGENT}/platform/bin/agent-run.sh"
-    grep -qE '^[[:space:]]*exec[[:space:]]+/usr/bin/claude[[:space:]]+"\$@"[[:space:]]*$' "$wrapper" || return 1
     [[ "$(cat "$wrapper")" != *"--bare"* ]] || return 1
 }
 
@@ -627,12 +629,17 @@ STUB
 # HA-05-S4 — wrapper body invariant (HOST-SAFE)
 # Spec: HA-05.1, HA-05.4, HA-06.2 (post-pivot: replaces the upsert-idempotency test)
 # ---------------------------------------------------------------------------
-@test "HA-05-S4 wrapper body invariant: exec claude \"\$@\", no --bare, key from CREDENTIALS_DIRECTORY" {
+@test "HA-05-S4 wrapper body invariant: no --bare, key from CREDENTIALS_DIRECTORY, ANTHROPIC_API_KEY exported (2b: exec-\$@ assertion moved to HB-01-S2)" {
     local wrapper="${REPO_ROOT_AGENT}/platform/bin/agent-run.sh"
     [ -f "$wrapper" ] || return 1
 
-    # Execs the real CLI, forwarding "$@"
-    grep -qE '^[[:space:]]*exec[[:space:]]+/usr/bin/claude[[:space:]]+"\$@"[[:space:]]*$' "$wrapper" || return 1
+    # 2b SUPERSEDES the exec-"$@" assertion: the 2b wrapper is a PRODUCTION LAUNCHER
+    # that hardcodes --permission-mode dontAsk -p "$(cat "$PROMPT_FILE")".
+    # The canonical 2b exec line is tested by HB-01-S2 (below).
+    # This test retains the invariants that ARE unchanged in 2b:
+    # - No --bare token anywhere (HA-05.4 / HB-01.6 ban preserved)
+    # - Key sourced ONLY from $CREDENTIALS_DIRECTORY (HA-08.4 / HB-01.7 preserved)
+    # - export ANTHROPIC_API_KEY present (HB-01.7 preserved)
 
     # No --bare token anywhere
     [[ "$(cat "$wrapper")" != *"--bare"* ]] || return 1
@@ -914,6 +921,173 @@ TSCRIPT
 
     run _assert_r9_r12_invariant "$fixture"
     [ "$status" -eq 0 ]
+}
+
+# ===========================================================================
+# Phase 5d: HOST-SAFE cluster C3 — 2b wrapper + prompt-file + unit assertions
+# U1-T1 scenarios: HB-01-S2, HB-01-S2b, HB-01-S4, HB-01-S5
+# U1-T2 scenario:  HB-05-S1 (probe-invocation source assertions)
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# HB-01-S2 — wrapper (2b) contains the canonical exec line and lacks forbidden tokens
+# Spec: HB-01.3, HB-01.6
+# Tier: HOST-SAFE
+# ---------------------------------------------------------------------------
+@test "HB-01-S2 wrapper 2b contains canonical exec line and lacks forbidden tokens" {
+    local wrapper="${REPO_ROOT_AGENT}/platform/bin/agent-run.sh"
+    [ -f "$wrapper" ] || return 1
+    local content
+    content="$(cat "$wrapper")"
+
+    # Must contain the canonical exec line (byte-exact, per design §3 + HB-01.3)
+    [[ "$content" == *'exec /usr/bin/claude --permission-mode dontAsk -p "$(cat "$PROMPT_FILE")"'* ]] || return 1
+
+    # --permission-mode dontAsk MUST appear before -p in that exec line
+    # Verify order: the exec line must have --permission-mode dontAsk before -p.
+    # Exclude comment lines first (agent-run.sh line 8 is a comment that also contains
+    # 'exec /usr/bin/claude'); we want exactly the real exec line.
+    local exec_line
+    exec_line="$(printf '%s' "$content" | grep -v '^[[:space:]]*#' | grep 'exec /usr/bin/claude')" || return 1
+    local pos_pm pos_p
+    pos_pm="${exec_line%%--permission-mode*}"
+    pos_p="${exec_line%% -p *}"
+    # pos_pm length < pos_p length means --permission-mode appears before -p
+    [[ "${#pos_pm}" -lt "${#pos_p}" ]] || return 1
+
+    # $PROMPT_FILE must be double-quoted around the canonical path
+    [[ "$content" == *'"$PROMPT_FILE"'* ]] || return 1
+
+    # Must NOT contain --bare anywhere (HB-01.6 ban)
+    [[ "$content" != *"--bare"* ]] || return 1
+
+    # Must NOT contain the old 2a exec line (exec /usr/bin/claude "$@")
+    grep -qE '^[[:space:]]*exec[[:space:]]+/usr/bin/claude[[:space:]]+"\$@"[[:space:]]*$' "$wrapper" && return 1 || true
+}
+
+# ---------------------------------------------------------------------------
+# HB-01-S2b — wrapper exits non-zero when invoked without -p (HB-01.8 guard)
+# Spec: HB-01.8
+# Tier: HOST-SAFE
+# ---------------------------------------------------------------------------
+@test "HB-01-S2b wrapper exits non-zero and prints error when invoked without -p" {
+    local wrapper="${REPO_ROOT_AGENT}/platform/bin/agent-run.sh"
+    [ -f "$wrapper" ] || return 1
+
+    # Run the wrapper in a subshell with a stub CREDENTIALS_DIRECTORY so the
+    # auth block succeeds, but WITHOUT -p, to trigger the HB-01.8 guard.
+    local creds="${BATS_TMPDIR}/creds-hb01s2b"
+    mkdir -p "$creds"
+    printf 'sk-test-DUMMY' > "${creds}/anthropic-api-key"
+
+    # Stub the exec so the wrapper never actually invokes claude.
+    # Replace only the exec line; the guard code remains present and must fire BEFORE exec.
+    local probe="${BATS_TMPDIR}/wrapper-hb01s2b-probe.sh"
+    # shellcheck disable=SC2016
+    sed 's#^exec /usr/bin/claude.*#printf "EXEC_REACHED\n"; exit 0#' \
+        "$wrapper" > "$probe"
+    chmod +x "$probe"
+
+    # Case 1: invoke WITHOUT any -p arg — guard MUST fire → exit non-zero, error on stderr.
+    # Use --separate-stderr so $stderr captures only fd-2 output (agent-run.sh >&2).
+    run --separate-stderr env CREDENTIALS_DIRECTORY="$creds" bash "$probe"
+    [ "$status" -ne 0 ] || return 1
+    # The error message must be on stderr (agent-run.sh prints to >&2)
+    [[ "$stderr" == *"-p"* ]] || return 1
+
+    # Case 2: invoke with --print (contains the substring "-p" but is NOT standalone -p).
+    # A $* substring implementation would falsely pass this; the correct iterate-"$@"
+    # implementation MUST still fire the guard → exit non-zero.
+    run --separate-stderr env CREDENTIALS_DIRECTORY="$creds" bash "$probe" --print
+    [ "$status" -ne 0 ] || return 1
+
+    # Case 3: invoke with -p as a STANDALONE positional argument.
+    # The guard MUST pass (found=1) and exec must be reached → EXEC_REACHED on stdout, exit 0.
+    run --separate-stderr env CREDENTIALS_DIRECTORY="$creds" bash "$probe" -p
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"EXEC_REACHED"* ]] || return 1
+}
+
+# ---------------------------------------------------------------------------
+# HB-01-S4 — PROMPT_FILE in the wrapper equals the canonical path and is outside /opt/osgania/client
+# Spec: HB-01.4
+# Tier: HOST-SAFE
+# ---------------------------------------------------------------------------
+@test "HB-01-S4 PROMPT_FILE in wrapper equals canonical path and is outside client workspace" {
+    local wrapper="${REPO_ROOT_AGENT}/platform/bin/agent-run.sh"
+    [ -f "$wrapper" ] || return 1
+    local content
+    content="$(cat "$wrapper")"
+
+    # PROMPT_FILE must equal the canonical installation path
+    [[ "$content" == *'PROMPT_FILE="/opt/osgania/platform/prompts/agent-prompt.txt"'* ]] || return 1
+
+    # Path must NOT begin with /opt/osgania/client (agent-writable subtree)
+    [[ "$content" != *'PROMPT_FILE="/opt/osgania/client'* ]] || return 1
+}
+
+# ---------------------------------------------------------------------------
+# HB-01-S5 — assembled service unit contains ExecStart byte-exactly + no --bare + no --permission-mode
+# Spec: HB-01.3, HB-01.6, HB-02.8 (telemetry env added in U1-T5)
+# Tier: HOST-SAFE
+# ---------------------------------------------------------------------------
+@test "HB-01-S5 assembled service unit ExecStart is byte-exact, no --bare, no --permission-mode" {
+    local unit
+    unit="$(build_service_unit)"
+
+    # ExecStart must be EXACTLY this string (byte-identical per HB-01.3)
+    local execstart_line
+    execstart_line="$(printf '%s' "$unit" | grep '^ExecStart=')"
+    [[ "$execstart_line" == "ExecStart=/opt/osgania/platform/bin/agent-run.sh -p" ]] || return 1
+
+    # Must NOT contain --bare (HB-01.6)
+    [[ "$unit" != *"--bare"* ]] || return 1
+
+    # ExecStart must NOT contain --permission-mode (HB-01.3: dontAsk is INSIDE the wrapper)
+    [[ "$execstart_line" != *"--permission-mode"* ]] || return 1
+}
+
+# ---------------------------------------------------------------------------
+# HB-05-S1 — probe-invocation source assertions (4-part, against provision-agent.sh)
+# Spec: HB-05.2, HB-05.4
+# Tier: HOST-SAFE (grep-based source assertions only)
+# Note: assertion (1) is RED vs 2a source (which calls "$wrapper"); GREEN after U1-T7.
+# ---------------------------------------------------------------------------
+@test "HB-05-S1 probe invocation calls /usr/bin/claude directly and has correct flags" {
+    # Extract the run_defense_in_depth_probe function body for all targeted assertions.
+    # Scoping to the function body makes every assertion non-vacuous: /usr/bin/claude also
+    # appears at `local claude_bin="${CLAUDE_BIN:-/usr/bin/claude}"` outside the invocation
+    # block, so a whole-file grep would pass even if the probe body reverted to "$wrapper".
+    local probe_body
+    probe_body="$(awk '/^run_defense_in_depth_probe\(\)/{found=1} found{print} /^}$/{if(found) exit}' \
+        "${REPO_ROOT_AGENT}/scripts/provision-agent.sh")"
+
+    # (1) Direct invocation: probe body calls /usr/bin/claude directly, NOT "$wrapper"
+    # The 2a probe contained: "$wrapper" -p --output-format stream-json ...
+    # The 2b probe must contain: /usr/bin/claude -p --output-format stream-json ...
+    # Assert on the extracted body (non-vacuous: fails if probe body reverts to "$wrapper")
+    printf '%s' "$probe_body" | grep -qF '/usr/bin/claude' || return 1
+
+    # The probe MUST NOT invoke "$wrapper" as the binary being called
+    # The 2a form was:  "$wrapper" -p --output-format ...
+    # We assert the probe body does NOT contain the pattern of invoking "$wrapper"
+    # as a command (the variable followed by a claude flag)
+    if printf '%s' "$probe_body" | grep -qE '"?\$wrapper"?[[:space:]]+-p'; then
+        return 1
+    fi
+
+    # (2) No --permission-mode dontAsk in the probe invocation (HB-05.2).
+    # The check must skip comment lines (lines starting with #) to avoid matching
+    # the JD-6 comment that explains WHY dontAsk must not be used.
+    if printf '%s' "$probe_body" | grep -v '^[[:space:]]*#' | grep -q -- '--permission-mode dontAsk'; then
+        return 1
+    fi
+
+    # (3) Must contain --dangerously-skip-permissions (HB-05.4)
+    printf '%s' "$probe_body" | grep -q -- '--dangerously-skip-permissions' || return 1
+
+    # (4) Must contain --output-format stream-json (HB-05.4)
+    printf '%s' "$probe_body" | grep -q -- '--output-format stream-json' || return 1
 }
 
 # ===========================================================================
