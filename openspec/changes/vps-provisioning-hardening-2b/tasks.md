@@ -171,13 +171,13 @@ This was safe in 2a because the 2a wrapper was a TRANSPARENT PASS-THROUGH (`exec
 
 The HB-01.8 `-p` guard passes (probe does pass `-p`), but the guard is irrelevant to the breakage — the damage is the arg-discarding and dontAsk injection in the wrapper's fixed exec line.
 
-**Resolution**: The HA-09 probe MUST invoke `/usr/bin/claude` DIRECTLY, exporting `ANTHROPIC_API_KEY` inline from `CREDENTIALS_DIRECTORY`, with no `--permission-mode dontAsk`. The probe tests the managed-settings layer, which is independent of the wrapper. See implementation task U1-T7.
+**Resolution**: The HA-09 probe MUST invoke `/usr/bin/claude` DIRECTLY, exporting `ANTHROPIC_API_KEY` inline from `AGENT_SECRETS_KEY` (`/etc/osgania/secrets/anthropic-api-key` — `CREDENTIALS_DIRECTORY` is a systemd LoadCredential var set only at service runtime; the provisioner runs outside systemd), with no `--permission-mode dontAsk`. The probe tests the managed-settings layer, which is independent of the wrapper. See implementation task U1-T7.
 
 **What to edit (contract changes — done by this task in the context of the JD-6-REAL fix)**:
 
 1. **spec.md, section HB-01.3** — Add the note that the 2b wrapper is a production launcher (not transparent), `"$@"` is discarded beyond the `-p` guard, and verification paths needing different claude args MUST invoke claude directly. [Applied.]
 
-2. **spec.md, section HB-05.2** — Rewritten: probe invokes `/usr/bin/claude` directly, exports `ANTHROPIC_API_KEY` itself from `CREDENTIALS_DIRECTORY`, MUST NOT include `--permission-mode dontAsk`, MUST NOT call `"$wrapper"` / `agent-run.sh`. [Applied.]
+2. **spec.md, section HB-05.2** — Rewritten: probe invokes `/usr/bin/claude` directly, exports `ANTHROPIC_API_KEY` itself from `AGENT_SECRETS_KEY` (`/etc/osgania/secrets/anthropic-api-key` — `CREDENTIALS_DIRECTORY` is runtime-only; probe uses the persistent on-disk path), MUST NOT include `--permission-mode dontAsk`, MUST NOT call `"$wrapper"` / `agent-run.sh`. [Applied.]
 
 3. **spec.md, section HB-05.4** — New sub-requirement: probe's direct-claude invocation MUST still produce a stream-json `init` event with `permissionMode != "bypassPermissions"` (VERIFIED), because `disableBypassPermissionsMode:"disable"` remains in managed-settings and neutralizes `--dangerously-skip-permissions` regardless of wrapper. [Applied.]
 
@@ -405,8 +405,10 @@ Write the `@test` block:
    # JD-6 resolution: probe calls /usr/bin/claude DIRECTLY — do NOT route through
    # agent-run.sh (the 2b wrapper is a production launcher that discards "$@" and
    # injects --permission-mode dontAsk, destroying both probe oracles).
+   # Read from AGENT_SECRETS_KEY (persistent on-disk path), NOT CREDENTIALS_DIRECTORY:
+   # the provisioner runs outside systemd, so the LoadCredential dir is unset here. Spec HB-05.2.
    local _probe_key
-   _probe_key="$(tr -d '[:space:]' < "${CREDENTIALS_DIRECTORY}/anthropic-api-key")"
+   _probe_key="$(tr -d '[:space:]' < "${AGENT_SECRETS_KEY}")"
    ANTHROPIC_API_KEY="$_probe_key" \
      /usr/bin/claude -p \
        --output-format stream-json \
