@@ -360,7 +360,9 @@ _assert_wrapper_invariant() {
     # Match the fixed token components: the exec, the flags, and the PROMPT_FILE reference.
     # We check three distinct anchors rather than a single grep with mixed quoting.
     local exec_check=0
-    printf '%s' "$content" | grep -q 'exec /usr/bin/claude --permission-mode dontAsk -p' && exec_check=1 || true
+    if printf '%s' "$content" | grep -q 'exec /usr/bin/claude --permission-mode dontAsk -p'; then
+        exec_check=1
+    fi
     if [[ "$exec_check" -eq 0 ]]; then
         printf 'provision-agent.sh: INVARIANT ABORT: wrapper %s does not contain the canonical 2b exec line — refusing to install\n' "$src" >&2
         return 1
