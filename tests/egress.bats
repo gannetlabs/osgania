@@ -245,7 +245,9 @@ teardown() {
     local out="$output"
     [[ "$out" == *"aios_egress"* ]] || return 1
     [[ "$out" == *"meta skuid 9001"* ]] || return 1
-    [[ "$out" == *"counter drop"* ]] || return 1
+    # nft renders the rule as "counter packets N bytes M drop" (not the literal
+    # "counter drop" of the source template), so assert both tokens are present.
+    [[ "$out" == *"counter"* && "$out" == *"drop"* ]] || return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -307,23 +309,32 @@ teardown() {
 # ---------------------------------------------------------------------------
 @test "HB-02-S9 real claude -p run under the egress wall completes end-to-end" {
     skip_unless_live_key
-    # On VPS with live key: start the agent service and assert the stream-json result
-    systemctl start osgania-agent.service 2>/dev/null || true
+    # On VPS with live key: invoke claude -p as uid 9001 (aios) THROUGH the wall and
+    # assert the stream-json result. terminal_reason / is_error / apiKeySource are fields
+    # of claude's stream-json events (the result and init events), NOT the camara.sh audit
+    # log (which records tool uses). This proves the agent's uid can complete a real claude
+    # run via Anthropic while the egress wall is loaded.
+    local key out
+    key="$(tr -d '[:space:]' < /etc/osgania/secrets/anthropic-api-key)"
+    out="$(runuser -u aios -- env -i \
+        HOME=/var/lib/osgania-agent \
+        XDG_CONFIG_HOME=/var/lib/osgania-agent \
+        ANTHROPIC_API_KEY="$key" \
+        PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+        /usr/bin/claude -p --output-format stream-json --verbose \
+        'Reply with the single word: ok' < /dev/null 2>/dev/null)"
 
-    # Target the last audit record that contains the expected fields
-    local audit_record
-    audit_record="$(tail -20 /var/log/osgania/audit.jsonl 2>/dev/null \
-        | jq -s 'map(select(.terminal_reason != null)) | last' 2>/dev/null)"
+    # The result event must report success and complete (claude reached Anthropic
+    # through the wall and the run finished cleanly).
+    local result
+    result="$(printf '%s' "$out" | jq -s 'map(select(.type == "result")) | last' 2>/dev/null)"
+    printf '%s' "$result" | jq -e '.subtype == "success"' > /dev/null 2>&1 || return 1
+    printf '%s' "$result" | jq -e '.terminal_reason == "completed"' > /dev/null 2>&1 || return 1
+    printf '%s' "$result" | jq -e '(.is_error // false) == false' > /dev/null 2>&1 || return 1
 
-    # terminal_reason must be "completed"
-    printf '%s\n' "$audit_record" | \
-        jq -e '.terminal_reason == "completed"' > /dev/null 2>/dev/null || return 1
-
-    # is_error must be false
-    printf '%s\n' "$audit_record" | \
-        jq -e '.is_error == false' > /dev/null 2>/dev/null || return 1
-
-    # apiKeySource must be ANTHROPIC_API_KEY
-    printf '%s\n' "$audit_record" | \
-        jq -e '.apiKeySource == "ANTHROPIC_API_KEY"' > /dev/null 2>/dev/null || return 1
+    # The init event must confirm the key was sourced from ANTHROPIC_API_KEY.
+    local init_src
+    init_src="$(printf '%s' "$out" \
+        | jq -rs 'map(select(.type == "system" and .subtype == "init")) | last | .apiKeySource' 2>/dev/null)"
+    [[ "$init_src" == "ANTHROPIC_API_KEY" ]] || return 1
 }
