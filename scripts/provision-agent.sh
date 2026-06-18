@@ -33,11 +33,20 @@ AGENT_SECRETS_KEY="/etc/osgania/secrets/anthropic-api-key"
 AGENT_SERVICE_UNIT="/etc/systemd/system/osgania-agent.service"
 AGENT_TIMER_UNIT="/etc/systemd/system/osgania-agent.timer"
 
+# U2: Anthropic egress CIDR constants (single refresh point — design §2 / HB-02.2).
+# These values are Anthropic's published stable inbound range ("will not change without
+# notice"). The .nft template in the repo uses the same literal values; these constants
+# are the authoritative single-edit location. Update both here and re-provision if
+# Anthropic changes their published IP range.
+ANTHROPIC_EGRESS_V4="160.79.104.0/23"
+ANTHROPIC_EGRESS_V6="2607:6bc0::/48"
+
 # ---------------------------------------------------------------------------
 # State variables — set by functions, read by main/print_summary
 # ---------------------------------------------------------------------------
 
 CHECK_MODE=0
+UNIT2_ONLY_MODE=0
 AGENT_CLI_VERSION_RECORDED=""
 AGENT_PROBE_STATUS="UNVERIFIED"
 
@@ -112,15 +121,20 @@ semver_gte() {
 # ---------------------------------------------------------------------------
 parse_args() {
     CHECK_MODE=0
+    UNIT2_ONLY_MODE=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --check)
                 CHECK_MODE=1
                 shift
                 ;;
+            --unit2-only)
+                UNIT2_ONLY_MODE=1
+                shift
+                ;;
             *)
                 printf 'provision-agent.sh: unknown option: %s\n' "$1" >&2
-                printf 'Usage: provision-agent.sh [--check]\n' >&2
+                printf 'Usage: provision-agent.sh [--check | --unit2-only]\n' >&2
                 return 1
                 ;;
         esac
@@ -942,6 +956,116 @@ print_summary() {
 }
 
 # ---------------------------------------------------------------------------
+# unit2_install_egress_wall
+#
+# Installs the hardware-proven nft egress wall for uid 9001 (Unit 2).
+# Spec: HB-02.1, HB-02.5, HB-02.7, HB-02.7a, HB-02.9, HB-02.10
+# Design: openspec/changes/vps-provisioning-hardening-2b/design.md §2
+#
+# PREREQUISITES:
+#   - Docker and Coolify must be absent (gate #10: their presence would insert
+#     DOCKER nft chains that interact with this table in unreviewed ways).
+#   - The repo path must be set via REPO_ROOT or resolved from BASH_SOURCE.
+#
+# BOOT-LOAD MECHANISM (HB-02.7):
+#   - The ruleset is installed immediately via `nft -f`.
+#   - Persistence is achieved by adding an `include` line to /etc/nftables.conf
+#     (Ubuntu 24.04's nftables.service loads this file on every boot).
+#   - nftables.service is enabled so the include fires on every boot.
+#
+# UID-ISOLATION ASSUMPTION (HB-02.10 — hardware-verified, documented here):
+#   This ruleset is UID 9001–scoped. The following services are confirmed to run
+#   under separate UIDs and are therefore NOT affected by this wall:
+#     - apt / package management: runs as _apt (uid varies) or root (uid 0)
+#     - NTP: systemd-timesync (uid varies per distro, never 9001)
+#     - Upstream DNS: systemd-resolved (uid varies, never 9001)
+#   Hardware gates #12/#13/#14 confirmed the above on the target box (2026-06-17).
+#   If any of these services are ever reconfigured to run as uid 9001, this wall
+#   would also block them — operator action required before such a change.
+#
+# DO NOT EXECUTE on macOS or outside a disposable Linux VPS.
+# This function mutates: /etc/osgania/nft/, /etc/nftables.conf, nft kernel state,
+# systemctl state. It MUST NOT be called from bats tests or any host-safe context.
+# ---------------------------------------------------------------------------
+unit2_install_egress_wall() {
+    # Resolve the repo root (same pattern used by install_wrapper / install_prompt_file)
+    local _repo_root
+    if [[ -n "${PROVISION_TEST_ALLOW_MUTATION:-}" && -n "${REPO_ROOT:-}" ]]; then
+        _repo_root="$REPO_ROOT"
+    else
+        _repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    fi
+
+    local _nft_src="${_repo_root}/platform/nft/osgania-egress.nft"
+    local _nft_dst_dir="/etc/osgania/nft"
+    local _nft_dst="${_nft_dst_dir}/osgania-egress.nft"
+    local _nftables_conf="/etc/nftables.conf"
+
+    # --- Prerequisite: assert no Docker / Coolify is installed (gate #10) ---
+    # Docker inserts DOCKER nft chains that interact with custom tables in
+    # unreviewed ways. Coolify manages Docker. Either presence is a hard stop.
+    if docker info > /dev/null 2>&1; then
+        printf 'provision-agent.sh: unit2_install_egress_wall: ABORT: Docker is installed (docker info succeeded).\n' >&2
+        printf 'provision-agent.sh: Docker inserts DOCKER nft chains that may interact with the osgania_egress table in unreviewed ways.\n' >&2
+        printf 'provision-agent.sh: Remove Docker or reconcile nft chain ordering before running Unit 2.\n' >&2
+        return 1
+    fi
+
+    # --- Create destination directory ---
+    install -d -o root -g root -m 0755 "$_nft_dst_dir"
+
+    # --- Render and install the nft ruleset (FIX-3: template substitution) ---
+    # The repo file uses @@ANTHROPIC_EGRESS_V4@@ / @@ANTHROPIC_EGRESS_V6@@ placeholders.
+    # Substitute the provisioner constants (single authoritative source — design §2 / HB-02.2)
+    # into a temp file, then install the rendered result. The rendered file is byte-equivalent
+    # to the hardware-proven ruleset when the constants hold the proven CIDR values.
+    local _rendered
+    _rendered="$(mktemp)"
+    sed -e "s|@@ANTHROPIC_EGRESS_V4@@|${ANTHROPIC_EGRESS_V4}|g" \
+        -e "s|@@ANTHROPIC_EGRESS_V6@@|${ANTHROPIC_EGRESS_V6}|g" \
+        "$_nft_src" > "$_rendered"
+    install -o root -g root -m 0644 "$_rendered" "$_nft_dst"
+    rm -f "$_rendered"
+    printf 'provision-agent.sh: unit2_install_egress_wall: installed rendered %s (v4=%s v6=%s)\n' \
+        "$_nft_dst" "$ANTHROPIC_EGRESS_V4" "$ANTHROPIC_EGRESS_V6"
+
+    # --- Idempotent table load (HB-02.9: delete-before-recreate) ---
+    # Deleting an absent table is harmless (the 2>/dev/null || true suppresses the error).
+    # This ensures re-running Unit 2 yields exactly one osgania_egress table.
+    nft delete table inet osgania_egress 2>/dev/null || true
+    nft -f "$_nft_dst"
+    printf 'provision-agent.sh: unit2_install_egress_wall: nft table inet osgania_egress loaded\n'
+
+    # --- Boot-load persistence (HB-02.7) ---
+    # Add an include line to /etc/nftables.conf if not already present.
+    # Ubuntu 24.04's nftables.service reads this file on every boot, so the
+    # osgania_egress table survives reboots without a separate drop-in unit.
+    local _include_line
+    _include_line="include \"${_nft_dst}\""
+    # FIX-7: if /etc/nftables.conf does not exist, create a minimal valid one before
+    # appending the include. Appending to an absent file produces a file with no
+    # shebang/flush preamble — nftables.service would fail to load it at boot.
+    if [[ ! -f "$_nftables_conf" ]]; then
+        printf '#!/usr/sbin/nft -f\nflush ruleset\n' > "$_nftables_conf"
+        printf 'provision-agent.sh: unit2_install_egress_wall: created minimal %s\n' "$_nftables_conf"
+    fi
+    if ! grep -qF "$_include_line" "$_nftables_conf" 2>/dev/null; then
+        printf '\n%s\n' "$_include_line" >> "$_nftables_conf"
+        printf 'provision-agent.sh: unit2_install_egress_wall: added include to %s\n' "$_nftables_conf"
+    else
+        printf 'provision-agent.sh: unit2_install_egress_wall: include already present in %s (idempotent)\n' "$_nftables_conf"
+    fi
+
+    # Enable nftables.service so the include fires on every boot (HB-02.7a boot ordering)
+    systemctl enable nftables.service
+    printf 'provision-agent.sh: unit2_install_egress_wall: nftables.service enabled for boot persistence\n'
+
+    printf 'provision-agent.sh: unit2_install_egress_wall: Unit 2 egress wall installed successfully\n'
+    printf 'provision-agent.sh: unit2_install_egress_wall: CIDRs: v4=%s v6=%s\n' \
+        "$ANTHROPIC_EGRESS_V4" "$ANTHROPIC_EGRESS_V6"
+}
+
+# ---------------------------------------------------------------------------
 # main <"$@">
 #
 # Orchestrates the ordered provisioning phases (steps 0-8 per design).
@@ -949,6 +1073,13 @@ print_summary() {
 # ---------------------------------------------------------------------------
 main() {
     parse_args "$@"
+
+    # --unit2-only: staged-deploy mode — install egress wall only, skip full provision flow.
+    # Preflight/arg-parsing is done; no key/user setup needed for this path.
+    if [[ -n "${UNIT2_ONLY_MODE:-}" && "$UNIT2_ONLY_MODE" -eq 1 ]]; then
+        unit2_install_egress_wall
+        return $?
+    fi
 
     # Step 0: Precondition checks (always run, including in --check mode)
     printf 'provision-agent.sh: [0/8] running precondition checks...\n'
@@ -990,6 +1121,10 @@ main() {
     # Step 6: Write systemd units (write + daemon-reload only; enable AFTER the probe — SC-2)
     printf 'provision-agent.sh: [6/8] writing systemd units...\n'
     write_units
+
+    # Step 6b: Unit 2 — install nft egress wall (HB-02; after write_units, before probe)
+    printf 'provision-agent.sh: [6b/8] installing nft egress wall (Unit 2)...\n'
+    unit2_install_egress_wall
 
     # Step 7: Defense-in-depth probe (final active step; runs BEFORE the timer is enabled)
     printf 'provision-agent.sh: [7/8] running defense-in-depth probe...\n'
