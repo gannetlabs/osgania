@@ -446,7 +446,7 @@ Write the `@test` block:
 
 ---
 
-### U2-T1 — [TEST] Write bats scenarios for nft ruleset structure and unit ordering (HOST-SAFE)
+### U2-T1 — [TEST] Write bats scenarios for nft ruleset structure and unit ordering (HOST-SAFE) — [Applied.]
 
 **Tier**: HOST-SAFE
 **Bats file**: `tests/egress.bats` (NEW file)
@@ -478,7 +478,7 @@ Create `tests/egress.bats` and write:
 
 ---
 
-### U2-T2 — [TEST] Write bats scenarios for live nft behavior (LINUX-ROOT + LIVE-KEY deferred)
+### U2-T2 — [TEST] Write bats scenarios for live nft behavior (LINUX-ROOT + LIVE-KEY deferred) — [Applied.]
 
 **Tier**: LINUX-ROOT and LINUX-ROOT/LIVE-KEY (deferred to disposable VPS)
 **Bats file**: `tests/egress.bats`
@@ -499,7 +499,7 @@ These tests MUST be added with skip guards now (TDD: write them, even if they ca
 
 ---
 
-### U2-T3 — [IMPLEMENT] Create `platform/nft/osgania-egress.nft`
+### U2-T3 — [IMPLEMENT] Create `platform/nft/osgania-egress.nft` — [Applied.]
 
 **Tier**: HOST-SAFE (file creation on macOS)
 **Requirements satisfied**: HB-02.1, HB-02.2, HB-02.4
@@ -526,13 +526,13 @@ table inet osgania_egress {
 }
 ```
 
-Note: The CIDR values MUST also be defined as provisioner constants in `scripts/provision-agent.sh` (e.g., `ANTHROPIC_EGRESS_V4="160.79.104.0/23"`, `ANTHROPIC_EGRESS_V6="2607:6bc0::/48"`) and templated into the `.nft` file at install time (or the `.nft` file uses the constants directly via the provisioner's install step). The `.nft` file in repo may contain the literal CIDRs since it is the canonical template; the provisioner constants are the single-edit refresh point.
+Note: The CIDR values are defined as provisioner constants in `scripts/provision-agent.sh` (`ANTHROPIC_EGRESS_V4` / `ANTHROPIC_EGRESS_V6`) and are the SINGLE authoritative source (design §2 / HB-02.2). The repo `.nft` file is a TEMPLATE containing `@@ANTHROPIC_EGRESS_V4@@` and `@@ANTHROPIC_EGRESS_V6@@` placeholder tokens — NOT literal CIDRs. `unit2_install_egress_wall()` renders the template via `sed` substitution at install time, producing a rendered file with the exact CIDR values from the constants. The rendered output, with the proven CIDRs, is byte-equivalent to the hardware-proven ruleset. To update the CIDRs, edit only the provisioner constants and re-provision; never hardcode CIDRs in the template.
 
 **Run tests**: `bats tests/egress.bats` — HB-02-S1 and HB-02-S2 MUST now pass (GREEN).
 
 ---
 
-### U2-T4 — [IMPLEMENT] Add Unit 2 provisioner step (nft install + idempotency + boot-load)
+### U2-T4 — [IMPLEMENT] Add Unit 2 provisioner step (nft install + idempotency + boot-load) — [Applied. HOST-SAFE: write+shellcheck only; execution deferred to VPS.]
 
 **Tier**: LINUX-ROOT (VPS only — no macOS mutation)
 **Requirements satisfied**: HB-02.1, HB-02.5, HB-02.7, HB-02.7a, HB-02.9, HB-02.10
@@ -592,7 +592,7 @@ On the disposable VPS with a real API key and after U2-T4+U2-T5 pass:
 
 ---
 
-### U2-T7 — [VERIFY] shellcheck sweep + HOST-SAFE bats full pass
+### U2-T7 — [VERIFY] shellcheck sweep + HOST-SAFE bats full pass — [Applied.]
 
 **Tier**: HOST-SAFE
 **Requirements satisfied**: HB-10.2
