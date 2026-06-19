@@ -810,7 +810,9 @@ Write `@test` blocks with `skip "LIVE-KEY required"` guards:
 
 ---
 
-### U3-T8 — [TEST + VERIFY] Run LINUX-ROOT fail-closed gate scenarios on disposable VPS
+### [x] U3-T8 — [TEST + VERIFY] Run LINUX-ROOT fail-closed gate scenarios on disposable VPS
+
+> **HARDWARE-PROVEN (2026-06-19):** S2 (drop removed)→REFUSE check(a); S2c (jump skuid removed, drop present)→check(a)+check(b) PASS, check(c) REFUSE (uid-9001 connected, exit 0); S3 (hermetic)→all three PASS (uid-9001 exit 124)→PROCEED→wrote allow. `allow` stayed `[]` on every REFUSE. (A check(a) render BLOCKER — `counter packets N bytes M drop` vs contiguous `counter drop`, the HB-02-S4 gotcha — was caught here and fixed in commit 6cc6973 with host-safe test HB-06-S2d.)
 
 **Tier**: LINUX-ROOT (via `scripts/run-live-key-tests.sh`)
 **Requirements satisfied**: HB-06.2a, HB-06.2b, HB-06.3, HB-06.4
@@ -824,7 +826,9 @@ On the disposable VPS:
 
 ---
 
-### U3-T9 — [TEST + VERIFY] Run LIVE-KEY autonomy + probe-survival scenarios on disposable VPS
+### [~] U3-T9 — [TEST + VERIFY] Run LIVE-KEY autonomy + probe-survival scenarios on disposable VPS
+
+> **HARDWARE STATUS (2026-06-19, PARTIAL):** wall hermetic ✓ (uid-9001→1.1.1.1:443 blocked, exit 124); `allow[]` written = the 4 reviewed entries ✓; gate logged PROCEED ✓; HA-09 probe VERIFIED ✓ (defaultMode stays "default"; allow write does not change it). **HB-03-S3 (autonomy behavioral: `npm test` permitted / `cargo build` denied with allow active) is BLOCKED** — the agent run returned `API Error: 400 — API usage limits, regain 2026-07-01`. This is the operator's Anthropic account quota, NOT a code defect; the box posture is correct (allow active, wall hermetic, dontAsk). Complete HB-03-S3 when quota restores or with an alternate key.
 
 **Tier**: LINUX-ROOT/LIVE-KEY (via `scripts/run-live-key-tests.sh`)
 **Requirements satisfied**: HB-03.5, HB-05.1, HB-06.2, HB-07.2
