@@ -1610,6 +1610,51 @@ TSCRIPT
 }
 
 # ---------------------------------------------------------------------------
+# HB-06-S2d — check (a) counter-drop matcher tolerates nft's stats render (HOST-SAFE)
+# Spec: HB-06.2a — regression guard for the HB-02-S4 render gotcha.
+# nft renders the drop rule as "counter packets N bytes M drop" (stats interpolated), NOT a
+# contiguous "counter drop". This unit-tests the REAL matcher (_aios_chain_has_counter_drop)
+# against the real nft render — the host-safe gap that let a false-negative reach the VPS in U3-T8.
+# ---------------------------------------------------------------------------
+@test "HB-06-S2d check(a) matcher accepts nft stats render, rejects missing drop (HOST-SAFE)" {
+    # Real nft render: stats BETWEEN counter and drop (no contiguous 'counter drop').
+    local with_drop="table inet osgania_egress {
+	chain out {
+		type filter hook output priority filter; policy accept;
+		meta skuid 9001 jump aios_egress
+	}
+	chain aios_egress {
+		ip daddr 160.79.104.0/23 tcp dport 443 accept
+		counter packets 2 bytes 140 drop
+	}
+}"
+    run _aios_chain_has_counter_drop "$with_drop"
+    [ "$status" -eq 0 ]
+
+    # Drop rule removed → matcher MUST fail (fail-closed).
+    local no_drop="table inet osgania_egress {
+	chain aios_egress {
+		ip daddr 160.79.104.0/23 tcp dport 443 accept
+	}
+}"
+    run _aios_chain_has_counter_drop "$no_drop"
+    [ "$status" -ne 0 ]
+
+    # 'counter' and 'drop' present but in DIFFERENT chains → chain-scoping MUST reject (no false pass).
+    local split="table inet osgania_egress {
+	chain other {
+		counter packets 0 bytes 0 accept
+		ip daddr 1.1.1.1 drop
+	}
+	chain aios_egress {
+		ip daddr 160.79.104.0/23 tcp dport 443 accept
+	}
+}"
+    run _aios_chain_has_counter_drop "$split"
+    [ "$status" -ne 0 ]
+}
+
+# ---------------------------------------------------------------------------
 # HB-06-S3 — Unit 3 proceeds end-to-end with wall hermetic; allow[] equals expected (LINUX-ROOT/LIVE-KEY)
 # Spec: HB-06.3, HB-06.4, HB-03.2
 # ---------------------------------------------------------------------------

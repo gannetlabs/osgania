@@ -1088,6 +1088,22 @@ unit2_install_egress_wall() {
 }
 
 # ---------------------------------------------------------------------------
+# _aios_chain_has_counter_drop <nft_table_output>
+#
+# Returns 0 iff the aios_egress chain body contains a counter-protected drop rule.
+# nft renders that rule as "counter packets N bytes M drop" — the stats are interpolated
+# BETWEEN the tokens, so there is NO contiguous "counter drop" substring (the HB-02-S4 render
+# gotcha). Match counter...drop on a single line. The chain body is extracted first (awk range)
+# so "counter"/"drop" appearing in OTHER chains of the same table cannot produce a false pass.
+# Host-safe + unit-testable (pure text); used by unit3_fail_closed_gate check (a).
+# ---------------------------------------------------------------------------
+_aios_chain_has_counter_drop() {
+    local nft_output="$1" body
+    body="$(printf '%s\n' "$nft_output" | awk '/chain aios_egress/,/^[[:space:]]*}/')"
+    printf '%s\n' "$body" | grep -qE 'counter.*drop'
+}
+
+# ---------------------------------------------------------------------------
 # unit3_fail_closed_gate
 #
 # Fail-closed precondition gate for the Unit 3 allow[] write.
@@ -1136,13 +1152,10 @@ unit3_fail_closed_gate() {
         printf 'provision-agent.sh: unit3_fail_closed_gate: REFUSE — check (a) FAILED: aios_egress chain not found in nft table\n' >&2
         return 1
     fi
-    # Assert that the aios_egress chain body contains the contiguous "counter drop" rule.
-    # Extracting the chain body first prevents a false pass from "counter" and "drop"
-    # appearing in different chains of the same table output.
-    local aios_chain_body
-    aios_chain_body="$(printf '%s\n' "$nft_output" | awk '/chain aios_egress/,/^[[:space:]]*}/')"
-    if [[ "$aios_chain_body" != *"counter drop"* ]]; then
-        printf 'provision-agent.sh: unit3_fail_closed_gate: REFUSE — check (a) FAILED: counter drop rule not found in aios_egress chain\n' >&2
+    # check (a) cont'd: the aios_egress chain must carry the counter-protected drop rule
+    # (chain-scoped, tolerant of nft's "counter packets N bytes M drop" stats render — HB-02-S4).
+    if ! _aios_chain_has_counter_drop "$nft_output"; then
+        printf 'provision-agent.sh: unit3_fail_closed_gate: REFUSE — check (a) FAILED: counter ... drop rule not found in aios_egress chain\n' >&2
         return 1
     fi
     printf 'provision-agent.sh: unit3_fail_closed_gate: check (a) PASSED — nft table inet osgania_egress loaded with aios_egress + counter drop\n'
