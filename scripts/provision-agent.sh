@@ -33,9 +33,13 @@ AGENT_WRAPPER_INSTALLED="/opt/osgania/platform/bin/agent-run.sh"
 # pass-through + dontAsk produced these permission_denials; the operator approved each entry
 # one-by-one (human review gate, HB-03.1/HB-03.3). DO NOT add entries that did not come from
 # observed denials + explicit review. Sorted JSON array (jq -cS canonical form).
-# NOTE: read-only commands (git status/diff/log, ls, find, *--version) are auto-permitted by
+# NOTE 1: read-only commands (git status/diff/log, ls, find, *--version) are auto-permitted by
 # Claude Code under dontAsk and need NO allow entry; only effectful commands are listed here.
-AGENT_EXPECTED_ALLOW='["Bash(make:*)","Bash(npm run build:*)","Bash(npm test:*)","Bash(pytest:*)"]'
+# NOTE 2: Claude Code's "Bash(cmd:*)" == "Bash(cmd *)" matches cmd WITH arguments only, NOT the
+# bare command (HB-03-S3 hardware finding, 2026-06-19). Each approved command therefore needs
+# BOTH the bare form "Bash(cmd)" and the trailing-wildcard "Bash(cmd *)" so the agent can run
+# `npm test` and `npm test --coverage` alike. Same 4 reviewed commands as U3-T6, two forms each.
+AGENT_EXPECTED_ALLOW='["Bash(make)","Bash(make *)","Bash(npm run build)","Bash(npm run build *)","Bash(npm test)","Bash(npm test *)","Bash(pytest)","Bash(pytest *)"]'
 AGENT_CLIENT_WORKSPACE="/opt/osgania/client"
 AGENT_STATE_DIR="/var/lib/osgania-agent"
 AGENT_SECRETS_KEY="/etc/osgania/secrets/anthropic-api-key"
