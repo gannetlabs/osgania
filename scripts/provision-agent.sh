@@ -29,11 +29,13 @@ AGENT_NODE_VERSION_FLOOR=18
 AGENT_WRAPPER_INSTALLED="/opt/osgania/platform/bin/agent-run.sh"
 
 # AGENT_EXPECTED_ALLOW — the reviewed broad allowlist (design §4 observe+review output).
-# Exact entries are recorded by U3-T6 on the VPS. DO NOT invent entries; update only after
-# human review of observed permission_denials from representative task runs (HB-03.3).
-# Current value: PLACEHOLDER for host-safe testing (U3-T2/U3-T7). Real entries come from
-# the §4 observe+review procedure run on the VPS (DEFERRED — see U3-T6).
-AGENT_EXPECTED_ALLOW='["Bash(echo *)"]'
+# Derived by U3-T6 on the VPS: real claude -p runs as uid-9001 under the wall + guardia
+# pass-through + dontAsk produced these permission_denials; the operator approved each entry
+# one-by-one (human review gate, HB-03.1/HB-03.3). DO NOT add entries that did not come from
+# observed denials + explicit review. Sorted JSON array (jq -cS canonical form).
+# NOTE: read-only commands (git status/diff/log, ls, find, *--version) are auto-permitted by
+# Claude Code under dontAsk and need NO allow entry; only effectful commands are listed here.
+AGENT_EXPECTED_ALLOW='["Bash(make:*)","Bash(npm run build:*)","Bash(npm test:*)","Bash(pytest:*)"]'
 AGENT_CLIENT_WORKSPACE="/opt/osgania/client"
 AGENT_STATE_DIR="/var/lib/osgania-agent"
 AGENT_SECRETS_KEY="/etc/osgania/secrets/anthropic-api-key"

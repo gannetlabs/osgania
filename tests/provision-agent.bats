@@ -1509,10 +1509,11 @@ TSCRIPT
 # assertion. Once U3-T7 is implemented, this MUST turn GREEN.
 # ---------------------------------------------------------------------------
 @test "HB-03-S1 fixture with expected allow[] passes _assert_r9_r12_invariant" {
-    # U3 placeholder expected set. Real entries derived on VPS via §4 observe+review.
-    local expected_allow='["Bash(echo *)"]'
+    # Data-driven: the fixture's allow[] IS AGENT_EXPECTED_ALLOW, so this test follows the
+    # reviewed set (U3-T6 output) without hardcoding it. The invariant must accept the
+    # activated set verbatim.
     local fixture="${BATS_TMPDIR}/hb03-s1-expected.json"
-    jq --argjson a "$expected_allow" '.permissions.allow = $a' \
+    jq --argjson a "$AGENT_EXPECTED_ALLOW" '.permissions.allow = $a' \
         "$MANAGED_SETTINGS_FIXTURE" > "$fixture"
 
     # Pass AGENT_EXPECTED_ALLOW explicitly to exercise the activated-allow path (FIX 2 adjustment).

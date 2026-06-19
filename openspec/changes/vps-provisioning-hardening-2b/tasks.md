@@ -723,7 +723,7 @@ Write `@test` blocks with `skip "LIVE-KEY required"` guards:
 
 ---
 
-### U3-T6 — [IMPLEMENT] Derive `allow[]` via the §4 observe+review procedure (apply-time, VPS)
+### [x] U3-T6 — [IMPLEMENT] Derive `allow[]` via the §4 observe+review procedure (apply-time, VPS)
 
 **Tier**: LINUX-ROOT/LIVE-KEY (manual + automated procedure, VPS)
 **Requirements satisfied**: HB-03.1, HB-03.3
