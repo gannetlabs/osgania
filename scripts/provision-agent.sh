@@ -27,6 +27,13 @@ AGENT_NODE_VERSION_FLOOR=18
 # AGENT_POLICY_FILE is resolved at runtime via MANAGED_SETTINGS_PATH to allow test overrides
 # Post-pivot (ADR-6): the launch WRAPPER replaces the obsolete apiKeyHelper.
 AGENT_WRAPPER_INSTALLED="/opt/osgania/platform/bin/agent-run.sh"
+
+# AGENT_EXPECTED_ALLOW — the reviewed broad allowlist (design §4 observe+review output).
+# Exact entries are recorded by U3-T6 on the VPS. DO NOT invent entries; update only after
+# human review of observed permission_denials from representative task runs (HB-03.3).
+# Current value: PLACEHOLDER for host-safe testing (U3-T2/U3-T7). Real entries come from
+# the §4 observe+review procedure run on the VPS (DEFERRED — see U3-T6).
+AGENT_EXPECTED_ALLOW='["Bash(echo *)"]'
 AGENT_CLIENT_WORKSPACE="/opt/osgania/client"
 AGENT_STATE_DIR="/var/lib/osgania-agent"
 AGENT_SECRETS_KEY="/etc/osgania/secrets/anthropic-api-key"
@@ -47,6 +54,7 @@ ANTHROPIC_EGRESS_V6="2607:6bc0::/48"
 
 CHECK_MODE=0
 UNIT2_ONLY_MODE=0
+UNIT3_ONLY_MODE=0
 AGENT_CLI_VERSION_RECORDED=""
 AGENT_PROBE_STATUS="UNVERIFIED"
 
@@ -122,6 +130,7 @@ semver_gte() {
 parse_args() {
     CHECK_MODE=0
     UNIT2_ONLY_MODE=0
+    UNIT3_ONLY_MODE=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --check)
@@ -132,9 +141,13 @@ parse_args() {
                 UNIT2_ONLY_MODE=1
                 shift
                 ;;
+            --unit3-only)
+                UNIT3_ONLY_MODE=1
+                shift
+                ;;
             *)
                 printf 'provision-agent.sh: unknown option: %s\n' "$1" >&2
-                printf 'Usage: provision-agent.sh [--check | --unit2-only]\n' >&2
+                printf 'Usage: provision-agent.sh [--check | --unit2-only | --unit3-only]\n' >&2
                 return 1
                 ;;
         esac
@@ -486,14 +499,19 @@ verify_managed_settings() {
 }
 
 # ---------------------------------------------------------------------------
-# _assert_r9_r12_invariant <json_file>
+# _assert_r9_r12_invariant <json_file> [expected_allow]
 #
 # Asserts all R9-R12 structural keys are present and correct in the given JSON
 # file. Aborts with a named failed assertion if any check fails.
 # Spec: HA-05.6
+#
+# expected_allow — optional JSON array string to compare against permissions.allow.
+#   Defaults to '[]' (the pre-U3 base state). Pass "$AGENT_EXPECTED_ALLOW" when
+#   verifying the activated post-U3 state (design §6).
 # ---------------------------------------------------------------------------
 _assert_r9_r12_invariant() {
     local f="$1"
+    local expected_allow_arg="${2:-[]}"
 
     # Check permissions.deny has exactly 6 entries
     local deny_count
@@ -521,12 +539,14 @@ _assert_r9_r12_invariant() {
         fi
     done
 
-    # Check permissions.allow == []
-    local allow_count
-    allow_count="$(jq '.permissions.allow | length' "$f" 2>/dev/null)" || allow_count=1
-    if [[ "$allow_count" != "0" ]]; then
-        printf 'provision-agent.sh: INVARIANT FAILED: permissions.allow is not empty (length=%s)\n' \
-            "$allow_count" >&2
+    # Check permissions.allow equals the expected set (positive expected-set; Amendment A2 / design §6).
+    # Default is '[]' (pre-U3 base state). Pass AGENT_EXPECTED_ALLOW for post-U3 activated state.
+    local live_allow expected_allow
+    live_allow="$(jq -cS '.permissions.allow' "$f" 2>/dev/null)"
+    expected_allow="$(printf '%s' "$expected_allow_arg" | jq -cS '.')"
+    if [[ "$live_allow" != "$expected_allow" ]]; then
+        printf 'provision-agent.sh: INVARIANT FAILED: permissions.allow=%s, expected exactly %s\n' \
+            "$live_allow" "$expected_allow" >&2
         return 1
     fi
 
@@ -1066,6 +1086,153 @@ unit2_install_egress_wall() {
 }
 
 # ---------------------------------------------------------------------------
+# unit3_fail_closed_gate
+#
+# Fail-closed precondition gate for the Unit 3 allow[] write.
+# Implements design §5 / spec HB-06.2 — THREE conditions must ALL hold before
+# writing permissions.allow[]. If any fails: exit 1, named error, no write.
+#
+# (a) nft wall loaded: `nft list table inet osgania_egress` exits 0 AND output
+#     contains `aios_egress` AND `counter drop`.
+#
+# (b) Root positive-control connect (REQUIRED — closes canary fail-open, HB-06.2b):
+#     before the uid-9001 self-check, confirm the canary is reachable from uid 0
+#     (the provisioner). This proves the canary endpoint is up on this network.
+#     Without it, an upstream filter that blocks 1.1.1.1:443 independently of the
+#     uid-9001 wall produces the same timeout (exit 124) → false PROCEED.
+#
+# (c) Live uid-9001 hermetic self-check BLOCKED: run via `systemd-run --uid=9001`.
+#     python3 preferred (user-space timeout, immune to tcp_syn_retries tuning);
+#     bash /dev/tcp is an acceptable fallback. Exit 124 is the ONLY PROCEED signal.
+#     Exit 0 = wall absent = REFUSE. Any other exit = REFUSE (fail-closed).
+#
+# DO NOT call this function from bats tests or any host-safe context.
+# It requires systemd, nft, and a live network (LINUX-ROOT only).
+# Spec: HB-06.1, HB-06.2a, HB-06.2b, HB-06.3, HB-06.4
+# Design: openspec/changes/vps-provisioning-hardening-2b/design.md §5
+# ---------------------------------------------------------------------------
+unit3_fail_closed_gate() {
+    local canary_host="1.1.1.1"
+    local canary_port="443"
+    local selfcheck_unit="osgania-egress-selfcheck"
+
+    # restore() — stop any orphaned uid-9001 transient unit on EXIT/INT/TERM
+    # No-op if the unit is not running (the 2>/dev/null || true suppresses the error).
+    # This is the concrete restore form required by the spec (no-op restore is NOT sufficient).
+    # The unit name is hardcoded (not via ${selfcheck_unit}) so the trap is safe even when
+    # fired from outside unit3_fail_closed_gate after a set -e abort (FIX 4).
+    restore() { systemctl stop osgania-egress-selfcheck.service 2>/dev/null || true; }
+    trap 'restore' EXIT INT TERM
+
+    # --- Check (a): nft wall loaded ---
+    local nft_output
+    nft_output="$(nft list table inet osgania_egress 2>/dev/null)" || {
+        printf 'provision-agent.sh: unit3_fail_closed_gate: REFUSE — check (a) FAILED: nft table inet osgania_egress is absent or inaccessible\n' >&2
+        return 1
+    }
+    if [[ "$nft_output" != *"aios_egress"* ]]; then
+        printf 'provision-agent.sh: unit3_fail_closed_gate: REFUSE — check (a) FAILED: aios_egress chain not found in nft table\n' >&2
+        return 1
+    fi
+    # Assert that the aios_egress chain body contains the contiguous "counter drop" rule.
+    # Extracting the chain body first prevents a false pass from "counter" and "drop"
+    # appearing in different chains of the same table output.
+    local aios_chain_body
+    aios_chain_body="$(printf '%s\n' "$nft_output" | awk '/chain aios_egress/,/^[[:space:]]*}/')"
+    if [[ "$aios_chain_body" != *"counter drop"* ]]; then
+        printf 'provision-agent.sh: unit3_fail_closed_gate: REFUSE — check (a) FAILED: counter drop rule not found in aios_egress chain\n' >&2
+        return 1
+    fi
+    printf 'provision-agent.sh: unit3_fail_closed_gate: check (a) PASSED — nft table inet osgania_egress loaded with aios_egress + counter drop\n'
+
+    # --- Check (b): root positive-control connect (canary reachable from uid 0) ---
+    # This proves the canary is up on this network BEFORE checking uid 9001 is blocked.
+    # Without this, an upstream filter that blocks 1.1.1.1:443 independently of the
+    # uid-9001 wall would produce the same timeout (exit 124) → false PROCEED.
+    local root_connect_exit=1
+    if python3 -c "import socket,sys
+s=socket.socket(); s.settimeout(5)
+try: s.connect(('${canary_host}',${canary_port})); sys.exit(0)
+except TimeoutError: sys.exit(124)
+except OSError: sys.exit(1)" 2>/dev/null; then
+        root_connect_exit=0
+    else
+        root_connect_exit=$?
+    fi
+    if [[ "$root_connect_exit" -ne 0 ]]; then
+        printf 'provision-agent.sh: unit3_fail_closed_gate: REFUSE — check (b) FAILED: root positive-control connect to %s:%s failed (exit %s); canary is unreachable or unsuitable on this network\n' \
+            "$canary_host" "$canary_port" "$root_connect_exit" >&2
+        return 1
+    fi
+    printf 'provision-agent.sh: unit3_fail_closed_gate: check (b) PASSED — canary %s:%s reachable from uid 0\n' \
+        "$canary_host" "$canary_port"
+
+    # --- Check (c): uid-9001 hermetic self-check BLOCKED (exit 124 is the ONLY PROCEED signal) ---
+    # Preferred python3 form (design §5 / spec HB-06.2c). The try/except ordering is
+    # MANDATORY: except TimeoutError MUST precede except OSError (TimeoutError is a
+    # subclass of OSError; reversing silently locks the gate to REFUSE forever).
+    # The --unit flag is mandatory so restore() can deterministically stop it.
+    # </dev/null is mandatory to prevent STDIN-EOF box-mutation incident (gate #2 event).
+    # --property=Environment='' prevents ANTHROPIC_API_KEY from leaking into the transient.
+    # Use || to capture exit code without triggering set -e (FIX 1).
+    # When the wall is PRESENT, python3 exits 124 → systemd-run exits 124; without
+    # the || pattern, set -euo pipefail would abort here before selfcheck_exit is set.
+    local selfcheck_exit=0
+    systemd-run --uid=9001 --gid=9001 --pipe --quiet --collect \
+        --unit="${selfcheck_unit}" \
+        --property=RestrictAddressFamilies='AF_INET AF_INET6' \
+        --property=Environment='' \
+        python3 -c "import socket,sys
+s=socket.socket(); s.settimeout(5)
+try: s.connect(('${canary_host}',${canary_port})); sys.exit(0)
+except TimeoutError: sys.exit(124)
+except OSError: sys.exit(1)" </dev/null || selfcheck_exit=$?
+    trap - EXIT INT TERM  # clear trap after transient exits cleanly
+
+    if [[ "$selfcheck_exit" -eq 0 ]]; then
+        printf 'provision-agent.sh: unit3_fail_closed_gate: REFUSE — check (c) FAILED: uid-9001 connected to canary (exit 0 = wall ABSENT); do NOT write allow[]\n' >&2
+        return 1
+    fi
+    if [[ "$selfcheck_exit" -ne 124 ]]; then
+        printf 'provision-agent.sh: unit3_fail_closed_gate: REFUSE — check (c) FAILED: uid-9001 self-check exited %s (not 0, not 124); fail-closed (only exit 124 = PROCEED)\n' \
+            "$selfcheck_exit" >&2
+        return 1
+    fi
+
+    printf 'provision-agent.sh: unit3_fail_closed_gate: check (c) PASSED — uid-9001 timed out (exit 124 = wall PRESENT); PROCEED\n'
+    printf 'provision-agent.sh: unit3_fail_closed_gate: all three checks PASSED — wall is loaded and hermetic; allow[] write authorized\n'
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# unit3_write_allow
+#
+# Writes AGENT_EXPECTED_ALLOW to permissions.allow[] in managed-settings.json
+# atomically (jq + mv pattern, same as other 2a/2b writes).
+# Spec: HB-03.2, HB-06.3
+# MUST only be called after unit3_fail_closed_gate returns 0.
+# ---------------------------------------------------------------------------
+unit3_write_allow() {
+    local policy_file="${MANAGED_SETTINGS_PATH:-/etc/claude-code/managed-settings.json}"
+
+    local tmp_out
+    tmp_out="$(mktemp)"
+    jq --argjson allow "$AGENT_EXPECTED_ALLOW" \
+        '.permissions.allow = $allow' \
+        "$policy_file" > "$tmp_out" 2>/dev/null || {
+        printf 'provision-agent.sh: unit3_write_allow: FATAL: jq failed to update permissions.allow\n' >&2
+        rm -f "$tmp_out"
+        return 1
+    }
+    if ! mv "$tmp_out" "$policy_file"; then
+        rm -f "$tmp_out"
+        printf 'provision-agent.sh: unit3_write_allow: FATAL: mv failed; temp file cleaned up\n' >&2
+        return 1
+    fi
+    printf 'provision-agent.sh: unit3_write_allow: permissions.allow written to %s\n' "$policy_file"
+}
+
+# ---------------------------------------------------------------------------
 # main <"$@">
 #
 # Orchestrates the ordered provisioning phases (steps 0-8 per design).
@@ -1079,6 +1246,25 @@ main() {
     if [[ -n "${UNIT2_ONLY_MODE:-}" && "$UNIT2_ONLY_MODE" -eq 1 ]]; then
         unit2_install_egress_wall
         return $?
+    fi
+
+    # --unit3-only: Unit 3 staged-deploy mode — run the fail-closed gate, write allow[],
+    # and verify the R9-R12 invariant. Requires Unit 2 to be proven hermetic (HB-06.1).
+    # This mode is LINUX-ROOT only (gate requires systemd + nft + live network).
+    if [[ -n "${UNIT3_ONLY_MODE:-}" && "$UNIT3_ONLY_MODE" -eq 1 ]]; then
+        printf 'provision-agent.sh: [U3] running fail-closed gate...\n'
+        unit3_fail_closed_gate
+        printf 'provision-agent.sh: [U3] writing permissions.allow[] (AGENT_EXPECTED_ALLOW)...\n'
+        local policy_file_u3="${MANAGED_SETTINGS_PATH:-/etc/claude-code/managed-settings.json}"
+        unit3_write_allow
+        printf 'provision-agent.sh: [U3] verifying R9-R12 invariant after allow[] write...\n'
+        # Pass AGENT_EXPECTED_ALLOW so the invariant verifies the activated post-U3 state (FIX 2).
+        # Capture the invariant exit code before printf, then return it (FIX 8 — $? after printf is
+        # always 0, masking invariant failures).
+        local invariant_rc=0
+        _assert_r9_r12_invariant "$policy_file_u3" "$AGENT_EXPECTED_ALLOW" || invariant_rc=$?
+        printf 'provision-agent.sh: Unit 3 complete — allow[] written and invariant verified\n'
+        return $invariant_rc
     fi
 
     # Step 0: Precondition checks (always run, including in --check mode)

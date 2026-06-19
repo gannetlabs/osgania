@@ -619,7 +619,7 @@ Before submitting PR-2:
 
 ---
 
-### U3-T1 — [TEST] Write bats scenarios for guardia 2b pass-through behavior (HOST-SAFE)
+### [x] U3-T1 — [TEST] Write bats scenarios for guardia 2b pass-through behavior (HOST-SAFE)
 
 **Tier**: HOST-SAFE
 **Bats file**: `tests/guardia.bats`
@@ -643,7 +643,7 @@ Note: amend the EXISTING `ls`/`npm test`/`git status` test cases to assert empty
 
 ---
 
-### U3-T2 — [TEST] Write bats scenarios for allow[] expected-set assertion (HOST-SAFE + fixture)
+### [x] U3-T2 — [TEST] Write bats scenarios for allow[] expected-set assertion (HOST-SAFE + fixture)
 
 **Tier**: HOST-SAFE (fixture-based; no live VPS)
 **Bats file**: `tests/provision-agent.bats`
@@ -662,7 +662,7 @@ Write the following `@test` blocks:
 
 ---
 
-### U3-T3 — [TEST] Write bats scenarios for fail-closed gate (LINUX-ROOT deferred)
+### [x] U3-T3 — [TEST] Write bats scenarios for fail-closed gate (LINUX-ROOT deferred)
 
 **Tier**: LINUX-ROOT (deferred to VPS)
 **Bats file**: `tests/provision-agent.bats`
@@ -678,7 +678,7 @@ Write `@test` blocks with `skip "LINUX-ROOT required"` guards:
 
 ---
 
-### U3-T4 — [TEST] Write LIVE-KEY scenario for autonomy behavioral contract (LINUX-ROOT/LIVE-KEY deferred)
+### [x] U3-T4 — [TEST] Write LIVE-KEY scenario for autonomy behavioral contract (LINUX-ROOT/LIVE-KEY deferred)
 
 **Tier**: LINUX-ROOT/LIVE-KEY (deferred)
 **Bats file**: `tests/provision-agent.bats`
@@ -692,7 +692,7 @@ Write `@test` blocks with `skip "LIVE-KEY required"` guards:
 
 ---
 
-### U3-T5 — [IMPLEMENT] Update `platform/hooks/guardia.sh` (2b: benign pass-through)
+### [x] U3-T5 — [IMPLEMENT] Update `platform/hooks/guardia.sh` (2b: benign pass-through)
 
 **Tier**: HOST-SAFE (file edit on macOS)
 **Requirements satisfied**: HB-04.1, HB-04.2, HB-04.3, HB-04.4, HB-04.5, Amendment A1
@@ -747,7 +747,7 @@ Write `@test` blocks with `skip "LIVE-KEY required"` guards:
 
 ---
 
-### U3-T7 — [IMPLEMENT] Update `provision-agent.sh`: replace allow==[] with positive expected-set assertion; add fail-closed gate
+### [x] U3-T7 — [IMPLEMENT] Update `provision-agent.sh`: replace allow==[] with positive expected-set assertion; add fail-closed gate
 
 **Tier**: LINUX-ROOT for gate (VPS) + HOST-SAFE for the assertion logic
 **Requirements satisfied**: HB-03.2, HB-06.1, HB-06.2a, HB-06.2b, HB-06.3, HB-06.4, Amendment A2, Amendment A3
@@ -775,21 +775,28 @@ Write `@test` blocks with `skip "LIVE-KEY required"` guards:
    fi
    ```
 
-3. **Add `unit3_fail_closed_gate()` function** implementing the full fail-closed activation gate (design §5, with JD-1+JD-5 fixes):
-   - Check (a): `nft list table inet osgania_egress` exits 0 AND output contains `aios_egress` AND `counter drop`. If absent → REFUSE with named error.
-   - Check (b): Run the uid-9001 hermetic self-check via the full `systemd-run` invocation (from design §5 / WU0-T5 aligned spec):
+3. **Add `unit3_fail_closed_gate()` function** implementing the full fail-closed activation gate (design §5, THREE conditions):
+   - Check (a): `nft list table inet osgania_egress` exits 0 AND output contains `aios_egress` AND the `aios_egress` chain body contains `counter drop`. If absent → REFUSE with named error.
+   - Check (b): Root positive-control connect (uid 0, no `systemd-run`). Attempt TCP connect to canary (`1.1.1.1:443`) as root. MUST succeed (exit 0). If the canary is unreachable from root, the canary is unsuitable → REFUSE. (Closes the canary fail-open: an upstream filter independently blocking the canary would produce the same uid-9001 timeout as a real wall.)
+   - Check (c): uid-9001 hermetic self-check BLOCKED. Run via the full `systemd-run` invocation. PRIMARY form is `python3` (design §5 — immune to kernel `tcp_syn_retries` tuning; bash `/dev/tcp` is a fallback only):
      ```bash
      systemd-run --uid=9001 --gid=9001 --pipe --quiet --collect \
+       --unit=osgania-egress-selfcheck \
        --property=RestrictAddressFamilies='AF_INET AF_INET6' \
        --property=Environment='' \
-       /bin/bash -c 'timeout 5 bash -c "exec 3<>/dev/tcp/1.1.1.1/443"' </dev/null
+       python3 -c "import socket,sys
+     s=socket.socket(); s.settimeout(5)
+     try: s.connect(('1.1.1.1',443)); sys.exit(0)
+     except TimeoutError: sys.exit(124)
+     except OSError: sys.exit(1)" </dev/null || selfcheck_exit=$?
      ```
-     With `trap 'restore' EXIT INT TERM` backstop (where `restore()` kills any orphaned uid-9001 transient).
-   - Exit-code semantics (JD-1 aligned):
+     `except TimeoutError` MUST precede `except OSError` (TimeoutError is a subclass of OSError).
+     With `trap 'restore' EXIT INT TERM` backstop; `restore()` hardcodes the unit name.
+   - Exit-code semantics for check (c):
      - Exit 0 = connected = wall ABSENT → REFUSE (do not write allow[]).
      - Exit 124 = timeout = wall PRESENT → PROCEED. This is the ONLY proceed signal.
      - Any other exit (1, ECONNREFUSED, etc.) → REFUSE (fail-closed).
-   - If either check fails: `exit 1` with named failure message; do NOT write allow[].
+   - All THREE must pass; any failure → `return 1` with named failure message; do NOT write allow[].
    - MUST include `</dev/null` on the `systemd-run` call.
    - MUST NOT include `ANTHROPIC_API_KEY` in the transient environment.
 

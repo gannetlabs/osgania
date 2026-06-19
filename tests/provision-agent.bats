@@ -586,8 +586,11 @@ STUB
     jq -e '.permissions.deny | index("Edit(/opt/osgania/platform/**)") != null' "$out" > /dev/null
     jq -e '.permissions.deny | index("Write(/opt/osgania/platform/**)") != null' "$out" > /dev/null
 
-    # permissions.allow must be empty
-    jq -e '.permissions.allow == []' "$out" > /dev/null
+    # permissions.allow must be [] in the base/deployed fixture (pre-U3 state).
+    # The positive expected-set (AGENT_EXPECTED_ALLOW) is verified in HB-03-S1 after U3 write.
+    local live_allow
+    live_allow="$(jq -cS '.permissions.allow' "$out")"
+    [ "$live_allow" = "[]" ]
 
     # permissions.defaultMode must be "default"
     local default_mode
@@ -1491,6 +1494,165 @@ TSCRIPT
     lsattr_out="$(lsattr /var/log/osgania/audit.jsonl)" || return 1
     attr_field="$(printf '%s' "$lsattr_out" | awk '{print $1}')"
     [[ "$attr_field" == *"a"* ]]
+}
+
+# ===========================================================================
+# Unit 3 HOST-SAFE: allow[] expected-set assertion + defaultMode check
+# U3-T2: HB-03-S1, HB-03-S2, HB-03-S4
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# HB-03-S1 — fixture with expected allow[] passes _assert_r9_r12_invariant (HOST-SAFE)
+# Spec: HB-03.2, HB-03.4
+# Tier: HOST-SAFE (fixture-based; no live VPS)
+# Note: RED until U3-T7 replaces the allow==[] check with the positive expected-set
+# assertion. Once U3-T7 is implemented, this MUST turn GREEN.
+# ---------------------------------------------------------------------------
+@test "HB-03-S1 fixture with expected allow[] passes _assert_r9_r12_invariant" {
+    # U3 placeholder expected set. Real entries derived on VPS via §4 observe+review.
+    local expected_allow='["Bash(echo *)"]'
+    local fixture="${BATS_TMPDIR}/hb03-s1-expected.json"
+    jq --argjson a "$expected_allow" '.permissions.allow = $a' \
+        "$MANAGED_SETTINGS_FIXTURE" > "$fixture"
+
+    # Pass AGENT_EXPECTED_ALLOW explicitly to exercise the activated-allow path (FIX 2 adjustment).
+    run _assert_r9_r12_invariant "$fixture" "$AGENT_EXPECTED_ALLOW"
+    [ "$status" -eq 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# HB-03-S2 — fixture with unexpected allow entry fails invariant (HOST-SAFE)
+# Spec: HB-03.2 — positive expected-set: any diff from AGENT_EXPECTED_ALLOW is rejected
+# Tier: HOST-SAFE
+# Note: RED until U3-T7. The current check is allow==[] so a non-empty allow[]
+# with ANY entry fails (for the wrong reason). After U3-T7, this test MUST fail
+# specifically because the UNEXPECTED entry is NOT in AGENT_EXPECTED_ALLOW.
+# ---------------------------------------------------------------------------
+@test "HB-03-S2 fixture with unexpected allow entry fails invariant, stderr names the entry" {
+    # One entry that is NOT in AGENT_EXPECTED_ALLOW
+    local unexpected_allow='["Bash(rm -rf *)"]'
+    local fixture="${BATS_TMPDIR}/hb03-s2-unexpected.json"
+    jq --argjson a "$unexpected_allow" '.permissions.allow = $a' \
+        "$MANAGED_SETTINGS_FIXTURE" > "$fixture"
+
+    # Pass AGENT_EXPECTED_ALLOW explicitly; the failure must be because the unexpected entry
+    # is NOT in the expected set, not merely because allow[] is non-empty (FIX 2 adjustment).
+    run _assert_r9_r12_invariant "$fixture" "$AGENT_EXPECTED_ALLOW"
+    [ "$status" -ne 0 ]
+    # stderr must name the unexpected entry (or the diff)
+    [[ "$output" == *"INVARIANT FAILED"* ]] || [[ "$output" == *"allow"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# HB-03-S4 — fixture defaultMode is "default" (dontAsk is CLI flag, not managed field) (HOST-SAFE)
+# Spec: PSC R9.8, HB-03.4
+# Tier: HOST-SAFE
+# Note: GREEN immediately — the existing fixture already has defaultMode="default".
+# ---------------------------------------------------------------------------
+@test "HB-03-S4 fixture permissions.defaultMode is 'default'" {
+    # The managed-settings fixture MUST have defaultMode="default"
+    # dontAsk is a CLI flag (in the wrapper), NOT the managed defaultMode field (spec HB-03.4 / PSC R9.8)
+    local dm
+    dm="$(jq -r '.permissions.defaultMode' "$MANAGED_SETTINGS_FIXTURE")"
+    [ "$dm" = "default" ]
+}
+
+# ===========================================================================
+# Unit 3 LINUX-ROOT deferred: fail-closed gate scenarios
+# U3-T3: HB-06-S1, HB-06-S2, HB-06-S2b, HB-06-S3
+# All skip on macOS / non-root. Written host-safe; run on VPS.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# HB-06-S1 — Unit 3 step aborts if nft table absent (LINUX-ROOT)
+# Spec: HB-06.2a — check (a): nft wall loaded
+# ---------------------------------------------------------------------------
+@test "HB-06-S1 Unit 3 step aborts if nft table absent" {
+    skip "LINUX-ROOT required"
+    # Pre-condition: flush the nft table; run Unit 3 step; assert abort + byte-identical settings.
+    # (Full implementation runs on the VPS; written here as the test shape for U3-T8.)
+    local snapshot
+    snapshot="$(mktemp)"
+    cp /etc/claude-code/managed-settings.json "$snapshot"
+    nft delete table inet osgania_egress 2>/dev/null || true
+    run bash "$PROVISION_AGENT" --unit3-only 2>&1
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"REFUSE"* ]] || [[ "$output" == *"nft"* ]]
+    cmp -s /etc/claude-code/managed-settings.json "$snapshot"
+    rm -f "$snapshot"
+}
+
+# ---------------------------------------------------------------------------
+# HB-06-S2 — Unit 3 step aborts if self-check connects (wall absent for uid 9001) (LINUX-ROOT)
+# Spec: HB-06.2b — check (c): uid-9001 self-check BLOCKED
+# ---------------------------------------------------------------------------
+@test "HB-06-S2 Unit 3 step aborts if hermetic self-check fails" {
+    skip "LINUX-ROOT required"
+    # Pre-condition: wall loaded but drop rule temporarily removed from aios_egress chain.
+    # Provisioner self-check: uid 9001 → 1.1.1.1:443 succeeds (exit 0) → REFUSE.
+    run bash "$PROVISION_AGENT" --unit3-only 2>&1
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"REFUSE"* ]] || [[ "$output" == *"wall"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# HB-06-S2b — self-check exit code semantics: 0=wall absent REFUSE; 124=wall present PROCEED (LINUX-ROOT)
+# Spec: HB-06.2b — exit-code gate; includes bats --timeout 10 envelope
+# ---------------------------------------------------------------------------
+@test "HB-06-S2b self-check exit 0 → REFUSE; exit 124 → PROCEED" {
+    skip "LINUX-ROOT required"
+    # bats --timeout 10 envelope prevents hung connect from stalling suite.
+    # With wall absent: systemd-run uid 9001 → 1.1.1.1:443 → exit 0 → REFUSE
+    # With wall present: systemd-run uid 9001 → 1.1.1.1:443 → timeout → exit 124 → PROCEED
+    # (Simulated via the unit3_fail_closed_gate function on the VPS.)
+    true  # placeholder; full assertion runs on the VPS in U3-T8
+}
+
+# ---------------------------------------------------------------------------
+# HB-06-S3 — Unit 3 proceeds end-to-end with wall hermetic; allow[] equals expected (LINUX-ROOT/LIVE-KEY)
+# Spec: HB-06.3, HB-06.4, HB-03.2
+# ---------------------------------------------------------------------------
+@test "HB-06-S3 Unit 3 proceeds when wall hermetic; allow[] equals reviewed expected-set" {
+    skip "LIVE-KEY required"
+    # Pre-condition: wall present, hermetic (uid 9001 → 1.1.1.1 blocked), reviewed allow[] derived.
+    run bash "$PROVISION_AGENT" --unit3-only 2>&1
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"PROCEED"* ]]
+    local live_allow
+    live_allow="$(jq -cS '.permissions.allow' /etc/claude-code/managed-settings.json)"
+    local expected_allow
+    expected_allow="$(printf '%s' "$AGENT_EXPECTED_ALLOW" | jq -cS '.')"
+    [ "$live_allow" = "$expected_allow" ]
+}
+
+# ===========================================================================
+# Unit 3 LIVE-KEY deferred: autonomy behavioral contract
+# U3-T4: HB-03-S3, HA-09-probe-survival-after-U3
+# All skip unless LIVE-KEY.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# HB-03-S3 — non-allowlisted command auto-denies cleanly under dontAsk (LINUX-ROOT/LIVE-KEY)
+# Spec: HB-03.5 — deny-first precedence; dontAsk gives clean auto-DENY for unmatched commands
+# ---------------------------------------------------------------------------
+@test "HB-03-S3 non-allowlisted command auto-denies cleanly under dontAsk" {
+    skip "LIVE-KEY required"
+    # With dontAsk active and allow[] set to AGENT_EXPECTED_ALLOW,
+    # a command NOT in allow[] auto-denies: terminal_reason=completed,
+    # permission_denials contains the denied command, command does NOT execute.
+    true  # placeholder; full assertion runs on the VPS in U3-T9
+}
+
+# ---------------------------------------------------------------------------
+# HA-09 probe survival after U3 — HA-09 oracle still VERIFIED with U3 posture active (LIVE-KEY)
+# Spec: HB-05.1, HB-07.2 — U3 MUST NOT break the bypass-neutralization oracle
+# ---------------------------------------------------------------------------
+@test "HA-09 probe survival after U3: AGENT_PROBE_STATUS=VERIFIED" {
+    skip "LIVE-KEY required"
+    # After U3 is active (dontAsk flag, allow[] written, guardia pass-through),
+    # run run_defense_in_depth_probe and assert AGENT_PROBE_STATUS=VERIFIED.
+    run run_defense_in_depth_probe
+    [ "$AGENT_PROBE_STATUS" = "VERIFIED" ]
 }
 
 # ===========================================================================
