@@ -5,7 +5,7 @@
 # then execs the real CLI with the canonical prompt-file invocation.
 #
 # IMPORTANT (JD-6 / HB-01.3): This wrapper hardcodes the entire claude invocation:
-#   exec /usr/bin/claude --permission-mode dontAsk -p "$(cat "$PROMPT_FILE")"
+#   exec /usr/bin/claude --permission-mode dontAsk --settings /opt/osgania/platform/agent-settings.json --setting-sources "" -p "$(cat "$PROMPT_FILE")"
 # "$@" is NOT forwarded to claude; only the HB-01.8 -p guard checks it.
 # Any caller that needs different claude args (e.g. --output-format stream-json)
 # MUST invoke /usr/bin/claude DIRECTLY — do NOT route through this wrapper.
@@ -39,5 +39,12 @@ fi
 unset _found_p _arg
 
 # Production launch: hardcoded canonical invocation (HB-01.3).
-# --permission-mode dontAsk MUST precede -p so it is not consumed as the prompt value.
-exec /usr/bin/claude --permission-mode dontAsk -p "$(cat "$PROMPT_FILE")"
+# --permission-mode dontAsk MUST precede --settings, --setting-sources, and -p.
+# --settings loads the operator-managed allow[] from the root-owned platform layer;
+# the agent (aios) can read but NOT write this file (managed deny blocks Edit/Write
+# under /opt/osgania/platform/**). No chattr needed: ownership + root-owned parent suffice.
+# --setting-sources "" excludes user/project/local settings so the agent cannot
+# self-escalate by writing its own settings.json (allow[] is additive across sources;
+# an agent-writable source could otherwise add allow entries beyond the reviewed set).
+AGENT_SETTINGS_FILE="/opt/osgania/platform/agent-settings.json"
+exec /usr/bin/claude --permission-mode dontAsk --settings "$AGENT_SETTINGS_FILE" --setting-sources "" -p "$(cat "$PROMPT_FILE")"

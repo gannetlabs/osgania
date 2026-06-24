@@ -40,6 +40,7 @@ AGENT_WRAPPER_INSTALLED="/opt/osgania/platform/bin/agent-run.sh"
 # BOTH the bare form "Bash(cmd)" and the trailing-wildcard "Bash(cmd *)" so the agent can run
 # `npm test` and `npm test --coverage` alike. Same 4 reviewed commands as U3-T6, two forms each.
 AGENT_EXPECTED_ALLOW='["Bash(make)","Bash(make *)","Bash(npm run build)","Bash(npm run build *)","Bash(npm test)","Bash(npm test *)","Bash(pytest)","Bash(pytest *)"]'
+AGENT_ALLOW_SETTINGS="/opt/osgania/platform/agent-settings.json"
 AGENT_CLIENT_WORKSPACE="/opt/osgania/client"
 AGENT_STATE_DIR="/var/lib/osgania-agent"
 AGENT_SECRETS_KEY="/etc/osgania/secrets/anthropic-api-key"
@@ -389,15 +390,27 @@ _assert_wrapper_invariant() {
         return 1
     fi
 
-    # Canonical 2b exec line (HB-01.3): must be present.
-    # Match the fixed token components: the exec, the flags, and the PROMPT_FILE reference.
-    # We check three distinct anchors rather than a single grep with mixed quoting.
-    local exec_check=0
-    if printf '%s' "$content" | grep -q 'exec /usr/bin/claude --permission-mode dontAsk -p'; then
-        exec_check=1
+    # Canonical 2b exec line (HB-01.3 + Amendments A4/A5): must be present.
+    # IMPORTANT: ALL checks below strip comment lines first (grep -v '^[[:space:]]*#')
+    # so a wrapper that only contains the expected string in a COMMENT cannot pass.
+    # This applies to the AGENT_SETTINGS_FILE assignment check too (D5 fix).
+    # The wrapper uses AGENT_SETTINGS_FILE as a variable, so we check three anchors:
+    #   (1) a non-comment line assigns AGENT_SETTINGS_FILE to the platform path,
+    #   (2) a non-comment exec line contains --permission-mode dontAsk --settings,
+    #   (3) a non-comment exec line contains --setting-sources (self-escalation fix).
+    local non_comment
+    non_comment="$(printf '%s' "$content" | grep -v '^[[:space:]]*#')"
+
+    if ! printf '%s' "$non_comment" | grep -qF 'AGENT_SETTINGS_FILE="/opt/osgania/platform/agent-settings.json"'; then
+        printf 'provision-agent.sh: INVARIANT ABORT: wrapper %s does not assign AGENT_SETTINGS_FILE to platform path — refusing to install\n' "$src" >&2
+        return 1
     fi
-    if [[ "$exec_check" -eq 0 ]]; then
-        printf 'provision-agent.sh: INVARIANT ABORT: wrapper %s does not contain the canonical 2b exec line — refusing to install\n' "$src" >&2
+    if ! printf '%s' "$non_comment" | grep -q 'exec /usr/bin/claude --permission-mode dontAsk --settings'; then
+        printf 'provision-agent.sh: INVARIANT ABORT: wrapper %s exec line missing --permission-mode dontAsk --settings — refusing to install\n' "$src" >&2
+        return 1
+    fi
+    if ! printf '%s' "$non_comment" | grep -q -- '--setting-sources'; then
+        printf 'provision-agent.sh: INVARIANT ABORT: wrapper %s exec line missing --setting-sources — refusing to install\n' "$src" >&2
         return 1
     fi
     if ! printf '%s' "$content" | grep -q 'PROMPT_FILE'; then
@@ -505,19 +518,21 @@ verify_managed_settings() {
 }
 
 # ---------------------------------------------------------------------------
-# _assert_r9_r12_invariant <json_file> [expected_allow]
+# _assert_r9_r12_invariant <json_file> [_ignored]
 #
 # Asserts all R9-R12 structural keys are present and correct in the given JSON
 # file. Aborts with a named failed assertion if any check fails.
 # Spec: HA-05.6
 #
-# expected_allow — optional JSON array string to compare against permissions.allow.
-#   Defaults to '[]' (the pre-U3 base state). Pass "$AGENT_EXPECTED_ALLOW" when
-#   verifying the activated post-U3 state (design §6).
+# Amendment A4 (Approach B): managed-settings permissions.allow MUST always be [].
+# The reviewed allow[] now lives in /opt/osgania/platform/agent-settings.json (loaded
+# via wrapper --settings flag). A second argument is accepted for call-site compatibility
+# but is silently ignored — the check is hardcoded to [].
 # ---------------------------------------------------------------------------
 _assert_r9_r12_invariant() {
     local f="$1"
-    local expected_allow_arg="${2:-[]}"
+    # Amendment A4: managed allow is always []; ignore any second argument.
+    local expected_allow_arg="[]"
 
     # Check permissions.deny has exactly 6 entries
     local deny_count
@@ -545,8 +560,8 @@ _assert_r9_r12_invariant() {
         fi
     done
 
-    # Check permissions.allow equals the expected set (positive expected-set; Amendment A2 / design §6).
-    # Default is '[]' (pre-U3 base state). Pass AGENT_EXPECTED_ALLOW for post-U3 activated state.
+    # Amendment A4: second argument IGNORED — managed allow[] is always asserted as [].
+    # The reviewed allow[] lives in AGENT_ALLOW_SETTINGS (platform file), not managed-settings.
     local live_allow expected_allow
     live_allow="$(jq -cS '.permissions.allow' "$f" 2>/dev/null)"
     expected_allow="$(printf '%s' "$expected_allow_arg" | jq -cS '.')"
@@ -1226,29 +1241,78 @@ except OSError: sys.exit(1)" </dev/null || selfcheck_exit=$?
 # ---------------------------------------------------------------------------
 # unit3_write_allow
 #
-# Writes AGENT_EXPECTED_ALLOW to permissions.allow[] in managed-settings.json
-# atomically (jq + mv pattern, same as other 2a/2b writes).
+# Writes the reviewed AGENT_EXPECTED_ALLOW to /opt/osgania/platform/agent-settings.json
+# (Amendment A4 — Approach B). The file is loaded by the wrapper via --settings flag.
+# Protection: root:root 0644 ownership + parent dir root-owned + managed deny blocks
+# Edit/Write(/opt/osgania/platform/**) so the agent cannot modify it. No chattr needed.
 # Spec: HB-03.2, HB-06.3
 # MUST only be called after unit3_fail_closed_gate returns 0.
 # ---------------------------------------------------------------------------
 unit3_write_allow() {
-    local policy_file="${MANAGED_SETTINGS_PATH:-/etc/claude-code/managed-settings.json}"
+    local dest="${AGENT_ALLOW_SETTINGS}"
+
+    # Ensure the platform directory exists (should already, but be safe)
+    install -d -o root -g root -m 0755 "$(dirname "$dest")"
 
     local tmp_out
     tmp_out="$(mktemp)"
-    jq --argjson allow "$AGENT_EXPECTED_ALLOW" \
-        '.permissions.allow = $allow' \
-        "$policy_file" > "$tmp_out" 2>/dev/null || {
-        printf 'provision-agent.sh: unit3_write_allow: FATAL: jq failed to update permissions.allow\n' >&2
+    if ! jq -n --argjson allow "$AGENT_EXPECTED_ALLOW" '{permissions: {allow: $allow}}' \
+            > "$tmp_out" 2>/dev/null; then
+        printf 'provision-agent.sh: unit3_write_allow: FATAL: jq failed to build agent-settings JSON\n' >&2
         rm -f "$tmp_out"
-        return 1
-    }
-    if ! mv "$tmp_out" "$policy_file"; then
-        rm -f "$tmp_out"
-        printf 'provision-agent.sh: unit3_write_allow: FATAL: mv failed; temp file cleaned up\n' >&2
         return 1
     fi
-    printf 'provision-agent.sh: unit3_write_allow: permissions.allow written to %s\n' "$policy_file"
+    if ! install -o root -g root -m 0644 "$tmp_out" "$dest"; then
+        printf 'provision-agent.sh: unit3_write_allow: FATAL: install failed writing %s\n' "$dest" >&2
+        rm -f "$tmp_out"
+        return 1
+    fi
+    rm -f "$tmp_out"
+    printf 'provision-agent.sh: unit3_write_allow: reviewed allow[] written to %s (root:root 0644)\n' "$dest"
+}
+
+# ---------------------------------------------------------------------------
+# _assert_agent_allow_settings
+#
+# Verifies /opt/osgania/platform/agent-settings.json (Approach B):
+#   (a) file exists (fail-closed if absent)
+#   (b) jq-equality: permissions.allow == AGENT_EXPECTED_ALLOW
+#   (c) owner is root:root (LINUX-ROOT check; stat -c '%U:%G')
+# The jq-equality check is HOST-SAFE and testable against a fixture.
+# The owner check requires stat (Linux) and skips cleanly on macOS in bats.
+# Spec: HB-03.2, HB-06.3 (Amendment A4)
+# ---------------------------------------------------------------------------
+_assert_agent_allow_settings() {
+    local dest="${1:-$AGENT_ALLOW_SETTINGS}"
+
+    # (a) file must exist
+    if [[ ! -f "$dest" ]]; then
+        printf 'provision-agent.sh: INVARIANT FAILED: agent-settings file absent: %s\n' "$dest" >&2
+        return 1
+    fi
+
+    # (b) jq-equality: permissions.allow must equal AGENT_EXPECTED_ALLOW (canonical form)
+    local live_allow expected_allow
+    live_allow="$(jq -cS '.permissions.allow' "$dest" 2>/dev/null)" || live_allow="ERROR"
+    expected_allow="$(printf '%s' "$AGENT_EXPECTED_ALLOW" | jq -cS '.')"
+    if [[ "$live_allow" != "$expected_allow" ]]; then
+        printf 'provision-agent.sh: INVARIANT FAILED: agent-settings allow=%s, expected %s\n' \
+            "$live_allow" "$expected_allow" >&2
+        return 1
+    fi
+
+    # (c) owner must be root:root (LINUX-ROOT; gracefully skip when stat -c is unavailable)
+    if stat --version > /dev/null 2>&1; then
+        local owner
+        owner="$(stat -c '%U:%G' "$dest" 2>/dev/null)" || owner="unknown"
+        if [[ "$owner" != "root:root" ]]; then
+            printf 'provision-agent.sh: INVARIANT FAILED: agent-settings owner=%s, expected root:root\n' \
+                "$owner" >&2
+            return 1
+        fi
+    fi
+
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -1267,23 +1331,33 @@ main() {
         return $?
     fi
 
-    # --unit3-only: Unit 3 staged-deploy mode — run the fail-closed gate, write allow[],
-    # and verify the R9-R12 invariant. Requires Unit 2 to be proven hermetic (HB-06.1).
+    # --unit3-only: Unit 3 staged-deploy mode — run the fail-closed gate, write allow[]
+    # to the platform settings file, assert the platform file, and verify managed R9-R12.
+    # Requires Unit 2 to be proven hermetic (HB-06.1).
+    # Amendment A4 (Approach B): allow[] goes to AGENT_ALLOW_SETTINGS, not managed-settings.
     # This mode is LINUX-ROOT only (gate requires systemd + nft + live network).
     if [[ -n "${UNIT3_ONLY_MODE:-}" && "$UNIT3_ONLY_MODE" -eq 1 ]]; then
         printf 'provision-agent.sh: [U3] running fail-closed gate...\n'
         unit3_fail_closed_gate
-        printf 'provision-agent.sh: [U3] writing permissions.allow[] (AGENT_EXPECTED_ALLOW)...\n'
-        local policy_file_u3="${MANAGED_SETTINGS_PATH:-/etc/claude-code/managed-settings.json}"
+        printf 'provision-agent.sh: [U3] writing reviewed allow[] to platform settings file...\n'
         unit3_write_allow
-        printf 'provision-agent.sh: [U3] verifying R9-R12 invariant after allow[] write...\n'
-        # Pass AGENT_EXPECTED_ALLOW so the invariant verifies the activated post-U3 state (FIX 2).
-        # Capture the invariant exit code before printf, then return it (FIX 8 — $? after printf is
-        # always 0, masking invariant failures).
+        printf 'provision-agent.sh: [U3] asserting platform agent-settings file...\n'
+        local assert_rc=0
+        _assert_agent_allow_settings || assert_rc=$?
+        if [[ "$assert_rc" -ne 0 ]]; then
+            printf 'provision-agent.sh: Unit 3 FAILED — agent-settings assertion failed\n' >&2
+            return "$assert_rc"
+        fi
+        printf 'provision-agent.sh: [U3] verifying managed-settings R9-R12 invariant (allow must be [])...\n'
+        local policy_file_u3="${MANAGED_SETTINGS_PATH:-/etc/claude-code/managed-settings.json}"
         local invariant_rc=0
-        _assert_r9_r12_invariant "$policy_file_u3" "$AGENT_EXPECTED_ALLOW" || invariant_rc=$?
-        printf 'provision-agent.sh: Unit 3 complete — allow[] written and invariant verified\n'
-        return $invariant_rc
+        _assert_r9_r12_invariant "$policy_file_u3" || invariant_rc=$?
+        if [[ "$invariant_rc" -ne 0 ]]; then
+            printf 'provision-agent.sh: Unit 3 FAILED — managed R9-R12 invariant failed\n' >&2
+            return "$invariant_rc"
+        fi
+        printf 'provision-agent.sh: Unit 3 complete — allow[] written to platform settings and invariants verified\n'
+        return 0
     fi
 
     # Step 0: Precondition checks (always run, including in --check mode)

@@ -164,7 +164,7 @@ The 2a probe invokes the wrapper as:
 "$wrapper" -p --output-format stream-json --verbose --dangerously-skip-permissions 'Reply with the single word: ok'
 ```
 
-This was safe in 2a because the 2a wrapper was a TRANSPARENT PASS-THROUGH (`exec /usr/bin/claude "$@"`) — all args reached claude. The 2b wrapper is different: it hardcodes `exec /usr/bin/claude --permission-mode dontAsk -p "$(cat "$PROMPT_FILE")"` and DISCARDS `"$@"` entirely (beyond the HB-01.8 `-p` presence guard). Routing the probe through the 2b wrapper causes TWO failures:
+This was safe in 2a because the 2a wrapper was a TRANSPARENT PASS-THROUGH (`exec /usr/bin/claude "$@"`) — all args reached claude. The 2b wrapper is different: it hardcodes `exec /usr/bin/claude --permission-mode dontAsk --settings "$AGENT_SETTINGS_FILE" --setting-sources "" -p "$(cat "$PROMPT_FILE")"` (Amendments A4+A5) and DISCARDS `"$@"` entirely (beyond the HB-01.8 `-p` presence guard). Routing the probe through the 2b wrapper causes TWO failures:
 
 1. `--output-format stream-json --verbose --dangerously-skip-permissions` are DISCARDED → no stream-json `init` event → `permissionMode` field absent → oracle unreadable → **HB-05.1 BROKEN**.
 2. `--permission-mode dontAsk` is INJECTED into the probe path → **HB-05.2 VIOLATED**.
@@ -230,8 +230,8 @@ The HB-01.8 `-p` guard passes (probe does pass `-p`), but the guard is irrelevan
 Write (or update) the following `@test` blocks in `tests/provision-agent.bats`:
 
 1. **HB-01-S2** — assert `platform/bin/agent-run.sh` (2b version) contains:
-   - the canonical exec line `exec /usr/bin/claude --permission-mode dontAsk -p "$(cat "$PROMPT_FILE")"` (exact string match)
-   - `--permission-mode dontAsk` appears BEFORE `-p` in that exec line
+   - the canonical exec line `exec /usr/bin/claude --permission-mode dontAsk --settings "$AGENT_SETTINGS_FILE" --setting-sources "" -p "$(cat "$PROMPT_FILE")"` (exact string match; Amendments A4+A5)
+   - `--permission-mode dontAsk` appears BEFORE `--settings` BEFORE `--setting-sources` BEFORE `-p` in that exec line
    - `$PROMPT_FILE` is double-quoted and holds the canonical path
    - does NOT contain `--bare`
    - does NOT contain `exec /usr/bin/claude "$@"` (the old 2a exec line)
@@ -294,8 +294,9 @@ Write the `@test` block:
 
 3. Replace the final `exec /usr/bin/claude "$@"` with:
    ```bash
-   exec /usr/bin/claude --permission-mode dontAsk -p "$(cat "$PROMPT_FILE")"
+   exec /usr/bin/claude --permission-mode dontAsk --settings "$AGENT_SETTINGS_FILE" --setting-sources "" -p "$(cat "$PROMPT_FILE")"
    ```
+   (Amendments A4+A5: `--settings "$AGENT_SETTINGS_FILE"` loads the root-owned platform allow[]; `--setting-sources ""` excludes agent-writable sources to prevent additive self-escalation.)
 
 4. Preserve ALL lines above (auth block, `set -euo pipefail`, CREDENTIALS_DIRECTORY check, ANTHROPIC_API_KEY export).
 
@@ -749,9 +750,11 @@ Write `@test` blocks with `skip "LIVE-KEY required"` guards:
 
 ### [x] U3-T7 — [IMPLEMENT] Update `provision-agent.sh`: replace allow==[] with positive expected-set assertion; add fail-closed gate
 
+> **Amendment A4 (Approach B — 2026-06-24):** The reviewed allow[] is written to `/opt/osgania/platform/agent-settings.json` (root:root 0644), NOT managed-settings.json. The wrapper loads it via `--settings "$AGENT_SETTINGS_FILE"`. Two hardware-proven blockers drove this: (1) Claude Code 2.1.153 ignores managed-settings allow[]; (2) the first fix (user-settings + chattr +i on file) had a dir-swap self-escalation hole. See design.md Amendment A4 and engram #269 for full detail. `_assert_r9_r12_invariant` always asserts managed allow==[] (second arg ignored). New `_assert_agent_allow_settings()` asserts the platform file. `unit3_write_allow()` targets `$AGENT_ALLOW_SETTINGS`. `platform/bin/agent-run.sh` exec line gains `--settings /opt/osgania/platform/agent-settings.json` (between --permission-mode dontAsk and -p). New bats: HB-03-S5 (jq-equality fixture), HB-03-S6 (absent file fails), HB-03-S5b (LINUX-ROOT owner). HB-03-S1/S2 re-pointed to managed-always-[]. HB-06-S3 checks platform file, confirms managed stays [].
+
 **Tier**: LINUX-ROOT for gate (VPS) + HOST-SAFE for the assertion logic
-**Requirements satisfied**: HB-03.2, HB-06.1, HB-06.2a, HB-06.2b, HB-06.3, HB-06.4, Amendment A2, Amendment A3
-**Files changed**: `scripts/provision-agent.sh`
+**Requirements satisfied**: HB-03.2, HB-06.1, HB-06.2a, HB-06.2b, HB-06.3, HB-06.4, Amendment A2, Amendment A3, Amendment A4
+**Files changed**: `scripts/provision-agent.sh`, `platform/bin/agent-run.sh`, `tests/provision-agent.bats`
 
 **Changes**:
 
@@ -826,9 +829,9 @@ On the disposable VPS:
 
 ---
 
-### [~] U3-T9 — [TEST + VERIFY] Run LIVE-KEY autonomy + probe-survival scenarios on disposable VPS
+### [x] U3-T9 — [TEST + VERIFY] Run LIVE-KEY autonomy + probe-survival scenarios on disposable VPS
 
-> **HARDWARE STATUS (2026-06-19, PARTIAL):** wall hermetic ✓ (uid-9001→1.1.1.1:443 blocked, exit 124); `allow[]` written = the 4 reviewed entries ✓; gate logged PROCEED ✓; HA-09 probe VERIFIED ✓ (defaultMode stays "default"; allow write does not change it). **HB-03-S3 (autonomy behavioral: `npm test` permitted / `cargo build` denied with allow active) is BLOCKED** — the agent run returned `API Error: 400 — API usage limits, regain 2026-07-01`. This is the operator's Anthropic account quota, NOT a code defect; the box posture is correct (allow active, wall hermetic, dontAsk). Complete HB-03-S3 when quota restores or with an alternate key.
+> **HARDWARE-PROVEN (2026-06-24):** HB-03-S3 RAN on the VPS and is proven. Hardware findings: (1) `Bash(cmd:*)` in allow[] matches only WITH args — bare `npm test` was NOT matching because `cmd:*` requires at least one argument after the command; this exposed the Bash(cmd:*)==Bash(cmd *) matches-with-args-only gotcha and drove the bare+wildcard fix (both `"Bash(npm)"` and `"Bash(npm *)"` are now in the reviewed allow[]); (2) the B+ behavioral re-run is HARDWARE-PROVEN — bare `npm test` PERMITTED via platform allow[], planted user-settings `cargo build` DENIED (allow[] is additive but `--setting-sources ""` excludes user/project/local, so the planted allow had no effect — confirming Amendment A5 closes the self-escalation hole end-to-end).
 
 **Tier**: LINUX-ROOT/LIVE-KEY (via `scripts/run-live-key-tests.sh`)
 **Requirements satisfied**: HB-03.5, HB-05.1, HB-06.2, HB-07.2
