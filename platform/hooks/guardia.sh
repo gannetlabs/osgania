@@ -3,19 +3,28 @@
 #
 # Interface (Claude Code hook contract):
 #   Input:  single JSON object on STDIN (tool_name, tool_input, session_id)
-#   Output: hookSpecificOutput JSON on STDOUT
+#   Output: hookSpecificOutput JSON on STDOUT (ONLY on deny; empty on pass-through)
 #   Exit:   always 0 (R1.5)
 #
-# Decision algorithm (ordered, spec R2.1..R2.7, design Q2):
-#   0. tool_name != "Bash"          → defer  (R1.6)
-#   1. empty/invalid STDIN          → defer  (R4.5)
+# Decision algorithm (ordered, spec R2.1..R2.7, 2b Amendment A1):
+#   0. tool_name != "Bash"          → pass-through (exit 0, empty stdout) [2b: was defer; HB-04.3]
+#   1. empty/invalid STDIN          → pass-through (exit 0, empty stdout) [2b: was defer; HB-04.3]
 #   2. sudo token boundary match    → deny   (R2.1)
 #   3. curl/wget token boundary     → deny   (R2.2)
 #   4. rm -rf two-pass flag check   → deny   (R2.3)
 #   5. disk-wipe leading token      → deny   (R2.4)
 #   6. /etc/osgania/secrets substr  → deny   (R2.5)
 #   7. platform/ substring          → deny   (R2.6)
-#   8. else                         → defer  (R2.7)
+#   8. else                         → pass-through (exit 0, empty stdout) [2b: was defer; HB-04.1]
+#
+# 2b Amendment A1 (PSC R2.7): ALL non-deny branches now emit NOTHING and exit 0
+# (pass-through). Previously they emitted permissionDecision:"defer". Hardware gate
+# #1 exp6 proved defer is TERMINAL in headless -p and pre-empts the permission flow,
+# blocking even allowlisted non-Bash tools. Pass-through lets the normal flow
+# (deny[] → ask → allow[]) decide. Unit 3 only (2b).
+#
+# guardia has exactly ONE non-deny outcome: pass-through (exit 0, empty stdout).
+# It emits deny or it emits nothing. It never emits allow, ask, or defer. (HB-04)
 #
 # Non-goals:
 #   - No network calls (R4.1)
@@ -38,41 +47,38 @@ emit_deny() {
     exit 0
 }
 
-emit_defer() {
-    jq -cn \
-        '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"defer",permissionDecisionReason:""}}'
-    exit 0
-}
-
 # ---------------------------------------------------------------------------
 # Step 1 / Step 0 — read and parse STDIN
 # ---------------------------------------------------------------------------
 
 stdin_data="$(cat)"
 
-# Guard: empty STDIN → defer (R4.5)
+# Guard: empty STDIN → pass-through (R4.5; 2b Amendment A1: was emit_defer)
+# Hardware gate #1: defer is TERMINAL in headless -p; pass-through is safe.
 if [[ -z "$stdin_data" ]]; then
-    emit_defer
+    exit 0
 fi
 
-# Parse tool_name from JSON; on invalid JSON jq will fail → defer (R4.5)
+# Parse tool_name from JSON; on invalid JSON jq will fail → pass-through (R4.5; 2b Amendment A1)
 tool_name="$(printf '%s' "$stdin_data" | jq -r '.tool_name // empty' 2>/dev/null)" || true
 
 if [[ -z "$tool_name" ]]; then
-    emit_defer
+    exit 0
 fi
 
-# Step 0: only Bash tool calls are subject to the denylist (R1.6)
+# Step 0: only Bash tool calls are subject to the denylist (R1.6; 2b Amendment A1)
+# Non-Bash tools → pass-through (HB-04.3). Previously emitted defer which blocked
+# allowlisted non-Bash tools (Read, Write) in headless -p (gate #1).
 if [[ "$tool_name" != "Bash" ]]; then
-    emit_defer
+    exit 0
 fi
 
 # Extract the command string
 cmd="$(printf '%s' "$stdin_data" | jq -r '.tool_input.command // empty' 2>/dev/null)" || true
 
-# Missing or empty command → defer
+# Missing or empty command → pass-through (2b Amendment A1: was emit_defer)
 if [[ -z "$cmd" ]]; then
-    emit_defer
+    exit 0
 fi
 
 # ---------------------------------------------------------------------------
@@ -301,7 +307,8 @@ if printf '%s' "$cmd" | grep -qE '(^|[^[:alnum:]_])compgen[[:space:]]+(-[A-Za-z]
 fi
 
 # ---------------------------------------------------------------------------
-# Step 8 — default: defer (R2.7)
+# Step 8 — default: pass-through (PSC R2.7-2b amendment: was defer, now exit 0)
+# Hardware gate #1 exp6 proved: defer is TERMINAL in headless -p; pass-through
+# lets the normal flow (deny[] → ask → allow[]) decide. Unit 3 only (2b).
 # ---------------------------------------------------------------------------
-
-emit_defer
+exit 0

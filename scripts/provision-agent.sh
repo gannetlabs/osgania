@@ -27,17 +27,41 @@ AGENT_NODE_VERSION_FLOOR=18
 # AGENT_POLICY_FILE is resolved at runtime via MANAGED_SETTINGS_PATH to allow test overrides
 # Post-pivot (ADR-6): the launch WRAPPER replaces the obsolete apiKeyHelper.
 AGENT_WRAPPER_INSTALLED="/opt/osgania/platform/bin/agent-run.sh"
+
+# AGENT_EXPECTED_ALLOW — the reviewed broad allowlist (design §4 observe+review output).
+# Derived by U3-T6 on the VPS: real claude -p runs as uid-9001 under the wall + guardia
+# pass-through + dontAsk produced these permission_denials; the operator approved each entry
+# one-by-one (human review gate, HB-03.1/HB-03.3). DO NOT add entries that did not come from
+# observed denials + explicit review. Sorted JSON array (jq -cS canonical form).
+# NOTE 1: read-only commands (git status/diff/log, ls, find, *--version) are auto-permitted by
+# Claude Code under dontAsk and need NO allow entry; only effectful commands are listed here.
+# NOTE 2: Claude Code's "Bash(cmd:*)" == "Bash(cmd *)" matches cmd WITH arguments only, NOT the
+# bare command (HB-03-S3 hardware finding, 2026-06-19). Each approved command therefore needs
+# BOTH the bare form "Bash(cmd)" and the trailing-wildcard "Bash(cmd *)" so the agent can run
+# `npm test` and `npm test --coverage` alike. Same 4 reviewed commands as U3-T6, two forms each.
+AGENT_EXPECTED_ALLOW='["Bash(make)","Bash(make *)","Bash(npm run build)","Bash(npm run build *)","Bash(npm test)","Bash(npm test *)","Bash(pytest)","Bash(pytest *)"]'
+AGENT_ALLOW_SETTINGS="/opt/osgania/platform/agent-settings.json"
 AGENT_CLIENT_WORKSPACE="/opt/osgania/client"
 AGENT_STATE_DIR="/var/lib/osgania-agent"
 AGENT_SECRETS_KEY="/etc/osgania/secrets/anthropic-api-key"
 AGENT_SERVICE_UNIT="/etc/systemd/system/osgania-agent.service"
 AGENT_TIMER_UNIT="/etc/systemd/system/osgania-agent.timer"
 
+# U2: Anthropic egress CIDR constants (single refresh point — design §2 / HB-02.2).
+# These values are Anthropic's published stable inbound range ("will not change without
+# notice"). The .nft template in the repo uses the same literal values; these constants
+# are the authoritative single-edit location. Update both here and re-provision if
+# Anthropic changes their published IP range.
+ANTHROPIC_EGRESS_V4="160.79.104.0/23"
+ANTHROPIC_EGRESS_V6="2607:6bc0::/48"
+
 # ---------------------------------------------------------------------------
 # State variables — set by functions, read by main/print_summary
 # ---------------------------------------------------------------------------
 
 CHECK_MODE=0
+UNIT2_ONLY_MODE=0
+UNIT3_ONLY_MODE=0
 AGENT_CLI_VERSION_RECORDED=""
 AGENT_PROBE_STATUS="UNVERIFIED"
 
@@ -112,15 +136,25 @@ semver_gte() {
 # ---------------------------------------------------------------------------
 parse_args() {
     CHECK_MODE=0
+    UNIT2_ONLY_MODE=0
+    UNIT3_ONLY_MODE=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --check)
                 CHECK_MODE=1
                 shift
                 ;;
+            --unit2-only)
+                UNIT2_ONLY_MODE=1
+                shift
+                ;;
+            --unit3-only)
+                UNIT3_ONLY_MODE=1
+                shift
+                ;;
             *)
                 printf 'provision-agent.sh: unknown option: %s\n' "$1" >&2
-                printf 'Usage: provision-agent.sh [--check]\n' >&2
+                printf 'Usage: provision-agent.sh [--check | --unit2-only | --unit3-only]\n' >&2
                 return 1
                 ;;
         esac
@@ -356,15 +390,27 @@ _assert_wrapper_invariant() {
         return 1
     fi
 
-    # Canonical 2b exec line (HB-01.3): must be present.
-    # Match the fixed token components: the exec, the flags, and the PROMPT_FILE reference.
-    # We check three distinct anchors rather than a single grep with mixed quoting.
-    local exec_check=0
-    if printf '%s' "$content" | grep -q 'exec /usr/bin/claude --permission-mode dontAsk -p'; then
-        exec_check=1
+    # Canonical 2b exec line (HB-01.3 + Amendments A4/A5): must be present.
+    # IMPORTANT: ALL checks below strip comment lines first (grep -v '^[[:space:]]*#')
+    # so a wrapper that only contains the expected string in a COMMENT cannot pass.
+    # This applies to the AGENT_SETTINGS_FILE assignment check too (D5 fix).
+    # The wrapper uses AGENT_SETTINGS_FILE as a variable, so we check three anchors:
+    #   (1) a non-comment line assigns AGENT_SETTINGS_FILE to the platform path,
+    #   (2) a non-comment exec line contains --permission-mode dontAsk --settings,
+    #   (3) a non-comment exec line contains --setting-sources (self-escalation fix).
+    local non_comment
+    non_comment="$(printf '%s' "$content" | grep -v '^[[:space:]]*#')"
+
+    if ! printf '%s' "$non_comment" | grep -qF 'AGENT_SETTINGS_FILE="/opt/osgania/platform/agent-settings.json"'; then
+        printf 'provision-agent.sh: INVARIANT ABORT: wrapper %s does not assign AGENT_SETTINGS_FILE to platform path — refusing to install\n' "$src" >&2
+        return 1
     fi
-    if [[ "$exec_check" -eq 0 ]]; then
-        printf 'provision-agent.sh: INVARIANT ABORT: wrapper %s does not contain the canonical 2b exec line — refusing to install\n' "$src" >&2
+    if ! printf '%s' "$non_comment" | grep -q 'exec /usr/bin/claude --permission-mode dontAsk --settings'; then
+        printf 'provision-agent.sh: INVARIANT ABORT: wrapper %s exec line missing --permission-mode dontAsk --settings — refusing to install\n' "$src" >&2
+        return 1
+    fi
+    if ! printf '%s' "$non_comment" | grep -q -- '--setting-sources'; then
+        printf 'provision-agent.sh: INVARIANT ABORT: wrapper %s exec line missing --setting-sources — refusing to install\n' "$src" >&2
         return 1
     fi
     if ! printf '%s' "$content" | grep -q 'PROMPT_FILE'; then
@@ -472,14 +518,21 @@ verify_managed_settings() {
 }
 
 # ---------------------------------------------------------------------------
-# _assert_r9_r12_invariant <json_file>
+# _assert_r9_r12_invariant <json_file> [_ignored]
 #
 # Asserts all R9-R12 structural keys are present and correct in the given JSON
 # file. Aborts with a named failed assertion if any check fails.
 # Spec: HA-05.6
+#
+# Amendment A4 (Approach B): managed-settings permissions.allow MUST always be [].
+# The reviewed allow[] now lives in /opt/osgania/platform/agent-settings.json (loaded
+# via wrapper --settings flag). A second argument is accepted for call-site compatibility
+# but is silently ignored — the check is hardcoded to [].
 # ---------------------------------------------------------------------------
 _assert_r9_r12_invariant() {
     local f="$1"
+    # Amendment A4: managed allow is always []; ignore any second argument.
+    local expected_allow_arg="[]"
 
     # Check permissions.deny has exactly 6 entries
     local deny_count
@@ -507,12 +560,14 @@ _assert_r9_r12_invariant() {
         fi
     done
 
-    # Check permissions.allow == []
-    local allow_count
-    allow_count="$(jq '.permissions.allow | length' "$f" 2>/dev/null)" || allow_count=1
-    if [[ "$allow_count" != "0" ]]; then
-        printf 'provision-agent.sh: INVARIANT FAILED: permissions.allow is not empty (length=%s)\n' \
-            "$allow_count" >&2
+    # Amendment A4: second argument IGNORED — managed allow[] is always asserted as [].
+    # The reviewed allow[] lives in AGENT_ALLOW_SETTINGS (platform file), not managed-settings.
+    local live_allow expected_allow
+    live_allow="$(jq -cS '.permissions.allow' "$f" 2>/dev/null)"
+    expected_allow="$(printf '%s' "$expected_allow_arg" | jq -cS '.')"
+    if [[ "$live_allow" != "$expected_allow" ]]; then
+        printf 'provision-agent.sh: INVARIANT FAILED: permissions.allow=%s, expected exactly %s\n' \
+            "$live_allow" "$expected_allow" >&2
         return 1
     fi
 
@@ -942,6 +997,325 @@ print_summary() {
 }
 
 # ---------------------------------------------------------------------------
+# unit2_install_egress_wall
+#
+# Installs the hardware-proven nft egress wall for uid 9001 (Unit 2).
+# Spec: HB-02.1, HB-02.5, HB-02.7, HB-02.7a, HB-02.9, HB-02.10
+# Design: openspec/changes/vps-provisioning-hardening-2b/design.md §2
+#
+# PREREQUISITES:
+#   - Docker and Coolify must be absent (gate #10: their presence would insert
+#     DOCKER nft chains that interact with this table in unreviewed ways).
+#   - The repo path must be set via REPO_ROOT or resolved from BASH_SOURCE.
+#
+# BOOT-LOAD MECHANISM (HB-02.7):
+#   - The ruleset is installed immediately via `nft -f`.
+#   - Persistence is achieved by adding an `include` line to /etc/nftables.conf
+#     (Ubuntu 24.04's nftables.service loads this file on every boot).
+#   - nftables.service is enabled so the include fires on every boot.
+#
+# UID-ISOLATION ASSUMPTION (HB-02.10 — hardware-verified, documented here):
+#   This ruleset is UID 9001–scoped. The following services are confirmed to run
+#   under separate UIDs and are therefore NOT affected by this wall:
+#     - apt / package management: runs as _apt (uid varies) or root (uid 0)
+#     - NTP: systemd-timesync (uid varies per distro, never 9001)
+#     - Upstream DNS: systemd-resolved (uid varies, never 9001)
+#   Hardware gates #12/#13/#14 confirmed the above on the target box (2026-06-17).
+#   If any of these services are ever reconfigured to run as uid 9001, this wall
+#   would also block them — operator action required before such a change.
+#
+# DO NOT EXECUTE on macOS or outside a disposable Linux VPS.
+# This function mutates: /etc/osgania/nft/, /etc/nftables.conf, nft kernel state,
+# systemctl state. It MUST NOT be called from bats tests or any host-safe context.
+# ---------------------------------------------------------------------------
+unit2_install_egress_wall() {
+    # Resolve the repo root (same pattern used by install_wrapper / install_prompt_file)
+    local _repo_root
+    if [[ -n "${PROVISION_TEST_ALLOW_MUTATION:-}" && -n "${REPO_ROOT:-}" ]]; then
+        _repo_root="$REPO_ROOT"
+    else
+        _repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    fi
+
+    local _nft_src="${_repo_root}/platform/nft/osgania-egress.nft"
+    local _nft_dst_dir="/etc/osgania/nft"
+    local _nft_dst="${_nft_dst_dir}/osgania-egress.nft"
+    local _nftables_conf="/etc/nftables.conf"
+
+    # --- Prerequisite: assert no Docker / Coolify is installed (gate #10) ---
+    # Docker inserts DOCKER nft chains that interact with custom tables in
+    # unreviewed ways. Coolify manages Docker. Either presence is a hard stop.
+    if docker info > /dev/null 2>&1; then
+        printf 'provision-agent.sh: unit2_install_egress_wall: ABORT: Docker is installed (docker info succeeded).\n' >&2
+        printf 'provision-agent.sh: Docker inserts DOCKER nft chains that may interact with the osgania_egress table in unreviewed ways.\n' >&2
+        printf 'provision-agent.sh: Remove Docker or reconcile nft chain ordering before running Unit 2.\n' >&2
+        return 1
+    fi
+
+    # --- Create destination directory ---
+    install -d -o root -g root -m 0755 "$_nft_dst_dir"
+
+    # --- Render and install the nft ruleset (FIX-3: template substitution) ---
+    # The repo file uses @@ANTHROPIC_EGRESS_V4@@ / @@ANTHROPIC_EGRESS_V6@@ placeholders.
+    # Substitute the provisioner constants (single authoritative source — design §2 / HB-02.2)
+    # into a temp file, then install the rendered result. The rendered file is byte-equivalent
+    # to the hardware-proven ruleset when the constants hold the proven CIDR values.
+    local _rendered
+    _rendered="$(mktemp)"
+    sed -e "s|@@ANTHROPIC_EGRESS_V4@@|${ANTHROPIC_EGRESS_V4}|g" \
+        -e "s|@@ANTHROPIC_EGRESS_V6@@|${ANTHROPIC_EGRESS_V6}|g" \
+        "$_nft_src" > "$_rendered"
+    install -o root -g root -m 0644 "$_rendered" "$_nft_dst"
+    rm -f "$_rendered"
+    printf 'provision-agent.sh: unit2_install_egress_wall: installed rendered %s (v4=%s v6=%s)\n' \
+        "$_nft_dst" "$ANTHROPIC_EGRESS_V4" "$ANTHROPIC_EGRESS_V6"
+
+    # --- Idempotent table load (HB-02.9: delete-before-recreate) ---
+    # Deleting an absent table is harmless (the 2>/dev/null || true suppresses the error).
+    # This ensures re-running Unit 2 yields exactly one osgania_egress table.
+    nft delete table inet osgania_egress 2>/dev/null || true
+    nft -f "$_nft_dst"
+    printf 'provision-agent.sh: unit2_install_egress_wall: nft table inet osgania_egress loaded\n'
+
+    # --- Boot-load persistence (HB-02.7) ---
+    # Add an include line to /etc/nftables.conf if not already present.
+    # Ubuntu 24.04's nftables.service reads this file on every boot, so the
+    # osgania_egress table survives reboots without a separate drop-in unit.
+    local _include_line
+    _include_line="include \"${_nft_dst}\""
+    # FIX-7: if /etc/nftables.conf does not exist, create a minimal valid one before
+    # appending the include. Appending to an absent file produces a file with no
+    # shebang/flush preamble — nftables.service would fail to load it at boot.
+    if [[ ! -f "$_nftables_conf" ]]; then
+        printf '#!/usr/sbin/nft -f\nflush ruleset\n' > "$_nftables_conf"
+        printf 'provision-agent.sh: unit2_install_egress_wall: created minimal %s\n' "$_nftables_conf"
+    fi
+    if ! grep -qF "$_include_line" "$_nftables_conf" 2>/dev/null; then
+        printf '\n%s\n' "$_include_line" >> "$_nftables_conf"
+        printf 'provision-agent.sh: unit2_install_egress_wall: added include to %s\n' "$_nftables_conf"
+    else
+        printf 'provision-agent.sh: unit2_install_egress_wall: include already present in %s (idempotent)\n' "$_nftables_conf"
+    fi
+
+    # Enable nftables.service so the include fires on every boot (HB-02.7a boot ordering)
+    systemctl enable nftables.service
+    printf 'provision-agent.sh: unit2_install_egress_wall: nftables.service enabled for boot persistence\n'
+
+    printf 'provision-agent.sh: unit2_install_egress_wall: Unit 2 egress wall installed successfully\n'
+    printf 'provision-agent.sh: unit2_install_egress_wall: CIDRs: v4=%s v6=%s\n' \
+        "$ANTHROPIC_EGRESS_V4" "$ANTHROPIC_EGRESS_V6"
+}
+
+# ---------------------------------------------------------------------------
+# _aios_chain_has_counter_drop <nft_table_output>
+#
+# Returns 0 iff the aios_egress chain body contains a counter-protected drop rule.
+# nft renders that rule as "counter packets N bytes M drop" — the stats are interpolated
+# BETWEEN the tokens, so there is NO contiguous "counter drop" substring (the HB-02-S4 render
+# gotcha). Match counter...drop on a single line. The chain body is extracted first (awk range)
+# so "counter"/"drop" appearing in OTHER chains of the same table cannot produce a false pass.
+# Host-safe + unit-testable (pure text); used by unit3_fail_closed_gate check (a).
+# ---------------------------------------------------------------------------
+_aios_chain_has_counter_drop() {
+    local nft_output="$1" body
+    body="$(printf '%s\n' "$nft_output" | awk '/chain aios_egress/,/^[[:space:]]*}/')"
+    printf '%s\n' "$body" | grep -qE 'counter.*drop'
+}
+
+# ---------------------------------------------------------------------------
+# unit3_fail_closed_gate
+#
+# Fail-closed precondition gate for the Unit 3 allow[] write.
+# Implements design §5 / spec HB-06.2 — THREE conditions must ALL hold before
+# writing permissions.allow[]. If any fails: exit 1, named error, no write.
+#
+# (a) nft wall loaded: `nft list table inet osgania_egress` exits 0 AND output
+#     contains `aios_egress` AND `counter drop`.
+#
+# (b) Root positive-control connect (REQUIRED — closes canary fail-open, HB-06.2b):
+#     before the uid-9001 self-check, confirm the canary is reachable from uid 0
+#     (the provisioner). This proves the canary endpoint is up on this network.
+#     Without it, an upstream filter that blocks 1.1.1.1:443 independently of the
+#     uid-9001 wall produces the same timeout (exit 124) → false PROCEED.
+#
+# (c) Live uid-9001 hermetic self-check BLOCKED: run via `systemd-run --uid=9001`.
+#     python3 preferred (user-space timeout, immune to tcp_syn_retries tuning);
+#     bash /dev/tcp is an acceptable fallback. Exit 124 is the ONLY PROCEED signal.
+#     Exit 0 = wall absent = REFUSE. Any other exit = REFUSE (fail-closed).
+#
+# DO NOT call this function from bats tests or any host-safe context.
+# It requires systemd, nft, and a live network (LINUX-ROOT only).
+# Spec: HB-06.1, HB-06.2a, HB-06.2b, HB-06.3, HB-06.4
+# Design: openspec/changes/vps-provisioning-hardening-2b/design.md §5
+# ---------------------------------------------------------------------------
+unit3_fail_closed_gate() {
+    local canary_host="1.1.1.1"
+    local canary_port="443"
+    local selfcheck_unit="osgania-egress-selfcheck"
+
+    # restore() — stop any orphaned uid-9001 transient unit on EXIT/INT/TERM
+    # No-op if the unit is not running (the 2>/dev/null || true suppresses the error).
+    # This is the concrete restore form required by the spec (no-op restore is NOT sufficient).
+    # The unit name is hardcoded (not via ${selfcheck_unit}) so the trap is safe even when
+    # fired from outside unit3_fail_closed_gate after a set -e abort (FIX 4).
+    restore() { systemctl stop osgania-egress-selfcheck.service 2>/dev/null || true; }
+    trap 'restore' EXIT INT TERM
+
+    # --- Check (a): nft wall loaded ---
+    local nft_output
+    nft_output="$(nft list table inet osgania_egress 2>/dev/null)" || {
+        printf 'provision-agent.sh: unit3_fail_closed_gate: REFUSE — check (a) FAILED: nft table inet osgania_egress is absent or inaccessible\n' >&2
+        return 1
+    }
+    if [[ "$nft_output" != *"aios_egress"* ]]; then
+        printf 'provision-agent.sh: unit3_fail_closed_gate: REFUSE — check (a) FAILED: aios_egress chain not found in nft table\n' >&2
+        return 1
+    fi
+    # check (a) cont'd: the aios_egress chain must carry the counter-protected drop rule
+    # (chain-scoped, tolerant of nft's "counter packets N bytes M drop" stats render — HB-02-S4).
+    if ! _aios_chain_has_counter_drop "$nft_output"; then
+        printf 'provision-agent.sh: unit3_fail_closed_gate: REFUSE — check (a) FAILED: counter ... drop rule not found in aios_egress chain\n' >&2
+        return 1
+    fi
+    printf 'provision-agent.sh: unit3_fail_closed_gate: check (a) PASSED — nft table inet osgania_egress loaded with aios_egress + counter drop\n'
+
+    # --- Check (b): root positive-control connect (canary reachable from uid 0) ---
+    # This proves the canary is up on this network BEFORE checking uid 9001 is blocked.
+    # Without this, an upstream filter that blocks 1.1.1.1:443 independently of the
+    # uid-9001 wall would produce the same timeout (exit 124) → false PROCEED.
+    local root_connect_exit=1
+    if python3 -c "import socket,sys
+s=socket.socket(); s.settimeout(5)
+try: s.connect(('${canary_host}',${canary_port})); sys.exit(0)
+except TimeoutError: sys.exit(124)
+except OSError: sys.exit(1)" 2>/dev/null; then
+        root_connect_exit=0
+    else
+        root_connect_exit=$?
+    fi
+    if [[ "$root_connect_exit" -ne 0 ]]; then
+        printf 'provision-agent.sh: unit3_fail_closed_gate: REFUSE — check (b) FAILED: root positive-control connect to %s:%s failed (exit %s); canary is unreachable or unsuitable on this network\n' \
+            "$canary_host" "$canary_port" "$root_connect_exit" >&2
+        return 1
+    fi
+    printf 'provision-agent.sh: unit3_fail_closed_gate: check (b) PASSED — canary %s:%s reachable from uid 0\n' \
+        "$canary_host" "$canary_port"
+
+    # --- Check (c): uid-9001 hermetic self-check BLOCKED (exit 124 is the ONLY PROCEED signal) ---
+    # Preferred python3 form (design §5 / spec HB-06.2c). The try/except ordering is
+    # MANDATORY: except TimeoutError MUST precede except OSError (TimeoutError is a
+    # subclass of OSError; reversing silently locks the gate to REFUSE forever).
+    # The --unit flag is mandatory so restore() can deterministically stop it.
+    # </dev/null is mandatory to prevent STDIN-EOF box-mutation incident (gate #2 event).
+    # --property=Environment='' prevents ANTHROPIC_API_KEY from leaking into the transient.
+    # Use || to capture exit code without triggering set -e (FIX 1).
+    # When the wall is PRESENT, python3 exits 124 → systemd-run exits 124; without
+    # the || pattern, set -euo pipefail would abort here before selfcheck_exit is set.
+    local selfcheck_exit=0
+    systemd-run --uid=9001 --gid=9001 --pipe --quiet --collect \
+        --unit="${selfcheck_unit}" \
+        --property=RestrictAddressFamilies='AF_INET AF_INET6' \
+        --property=Environment='' \
+        python3 -c "import socket,sys
+s=socket.socket(); s.settimeout(5)
+try: s.connect(('${canary_host}',${canary_port})); sys.exit(0)
+except TimeoutError: sys.exit(124)
+except OSError: sys.exit(1)" </dev/null || selfcheck_exit=$?
+    trap - EXIT INT TERM  # clear trap after transient exits cleanly
+
+    if [[ "$selfcheck_exit" -eq 0 ]]; then
+        printf 'provision-agent.sh: unit3_fail_closed_gate: REFUSE — check (c) FAILED: uid-9001 connected to canary (exit 0 = wall ABSENT); do NOT write allow[]\n' >&2
+        return 1
+    fi
+    if [[ "$selfcheck_exit" -ne 124 ]]; then
+        printf 'provision-agent.sh: unit3_fail_closed_gate: REFUSE — check (c) FAILED: uid-9001 self-check exited %s (not 0, not 124); fail-closed (only exit 124 = PROCEED)\n' \
+            "$selfcheck_exit" >&2
+        return 1
+    fi
+
+    printf 'provision-agent.sh: unit3_fail_closed_gate: check (c) PASSED — uid-9001 timed out (exit 124 = wall PRESENT); PROCEED\n'
+    printf 'provision-agent.sh: unit3_fail_closed_gate: all three checks PASSED — wall is loaded and hermetic; allow[] write authorized\n'
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# unit3_write_allow
+#
+# Writes the reviewed AGENT_EXPECTED_ALLOW to /opt/osgania/platform/agent-settings.json
+# (Amendment A4 — Approach B). The file is loaded by the wrapper via --settings flag.
+# Protection: root:root 0644 ownership + parent dir root-owned + managed deny blocks
+# Edit/Write(/opt/osgania/platform/**) so the agent cannot modify it. No chattr needed.
+# Spec: HB-03.2, HB-06.3
+# MUST only be called after unit3_fail_closed_gate returns 0.
+# ---------------------------------------------------------------------------
+unit3_write_allow() {
+    local dest="${AGENT_ALLOW_SETTINGS}"
+
+    # Ensure the platform directory exists (should already, but be safe)
+    install -d -o root -g root -m 0755 "$(dirname "$dest")"
+
+    local tmp_out
+    tmp_out="$(mktemp)"
+    if ! jq -n --argjson allow "$AGENT_EXPECTED_ALLOW" '{permissions: {allow: $allow}}' \
+            > "$tmp_out" 2>/dev/null; then
+        printf 'provision-agent.sh: unit3_write_allow: FATAL: jq failed to build agent-settings JSON\n' >&2
+        rm -f "$tmp_out"
+        return 1
+    fi
+    if ! install -o root -g root -m 0644 "$tmp_out" "$dest"; then
+        printf 'provision-agent.sh: unit3_write_allow: FATAL: install failed writing %s\n' "$dest" >&2
+        rm -f "$tmp_out"
+        return 1
+    fi
+    rm -f "$tmp_out"
+    printf 'provision-agent.sh: unit3_write_allow: reviewed allow[] written to %s (root:root 0644)\n' "$dest"
+}
+
+# ---------------------------------------------------------------------------
+# _assert_agent_allow_settings
+#
+# Verifies /opt/osgania/platform/agent-settings.json (Approach B):
+#   (a) file exists (fail-closed if absent)
+#   (b) jq-equality: permissions.allow == AGENT_EXPECTED_ALLOW
+#   (c) owner is root:root (LINUX-ROOT check; stat -c '%U:%G')
+# The jq-equality check is HOST-SAFE and testable against a fixture.
+# The owner check requires stat (Linux) and skips cleanly on macOS in bats.
+# Spec: HB-03.2, HB-06.3 (Amendment A4)
+# ---------------------------------------------------------------------------
+_assert_agent_allow_settings() {
+    local dest="${1:-$AGENT_ALLOW_SETTINGS}"
+
+    # (a) file must exist
+    if [[ ! -f "$dest" ]]; then
+        printf 'provision-agent.sh: INVARIANT FAILED: agent-settings file absent: %s\n' "$dest" >&2
+        return 1
+    fi
+
+    # (b) jq-equality: permissions.allow must equal AGENT_EXPECTED_ALLOW (canonical form)
+    local live_allow expected_allow
+    live_allow="$(jq -cS '.permissions.allow' "$dest" 2>/dev/null)" || live_allow="ERROR"
+    expected_allow="$(printf '%s' "$AGENT_EXPECTED_ALLOW" | jq -cS '.')"
+    if [[ "$live_allow" != "$expected_allow" ]]; then
+        printf 'provision-agent.sh: INVARIANT FAILED: agent-settings allow=%s, expected %s\n' \
+            "$live_allow" "$expected_allow" >&2
+        return 1
+    fi
+
+    # (c) owner must be root:root (LINUX-ROOT; gracefully skip when stat -c is unavailable)
+    if stat --version > /dev/null 2>&1; then
+        local owner
+        owner="$(stat -c '%U:%G' "$dest" 2>/dev/null)" || owner="unknown"
+        if [[ "$owner" != "root:root" ]]; then
+            printf 'provision-agent.sh: INVARIANT FAILED: agent-settings owner=%s, expected root:root\n' \
+                "$owner" >&2
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # main <"$@">
 #
 # Orchestrates the ordered provisioning phases (steps 0-8 per design).
@@ -949,6 +1323,42 @@ print_summary() {
 # ---------------------------------------------------------------------------
 main() {
     parse_args "$@"
+
+    # --unit2-only: staged-deploy mode — install egress wall only, skip full provision flow.
+    # Preflight/arg-parsing is done; no key/user setup needed for this path.
+    if [[ -n "${UNIT2_ONLY_MODE:-}" && "$UNIT2_ONLY_MODE" -eq 1 ]]; then
+        unit2_install_egress_wall
+        return $?
+    fi
+
+    # --unit3-only: Unit 3 staged-deploy mode — run the fail-closed gate, write allow[]
+    # to the platform settings file, assert the platform file, and verify managed R9-R12.
+    # Requires Unit 2 to be proven hermetic (HB-06.1).
+    # Amendment A4 (Approach B): allow[] goes to AGENT_ALLOW_SETTINGS, not managed-settings.
+    # This mode is LINUX-ROOT only (gate requires systemd + nft + live network).
+    if [[ -n "${UNIT3_ONLY_MODE:-}" && "$UNIT3_ONLY_MODE" -eq 1 ]]; then
+        printf 'provision-agent.sh: [U3] running fail-closed gate...\n'
+        unit3_fail_closed_gate
+        printf 'provision-agent.sh: [U3] writing reviewed allow[] to platform settings file...\n'
+        unit3_write_allow
+        printf 'provision-agent.sh: [U3] asserting platform agent-settings file...\n'
+        local assert_rc=0
+        _assert_agent_allow_settings || assert_rc=$?
+        if [[ "$assert_rc" -ne 0 ]]; then
+            printf 'provision-agent.sh: Unit 3 FAILED — agent-settings assertion failed\n' >&2
+            return "$assert_rc"
+        fi
+        printf 'provision-agent.sh: [U3] verifying managed-settings R9-R12 invariant (allow must be [])...\n'
+        local policy_file_u3="${MANAGED_SETTINGS_PATH:-/etc/claude-code/managed-settings.json}"
+        local invariant_rc=0
+        _assert_r9_r12_invariant "$policy_file_u3" || invariant_rc=$?
+        if [[ "$invariant_rc" -ne 0 ]]; then
+            printf 'provision-agent.sh: Unit 3 FAILED — managed R9-R12 invariant failed\n' >&2
+            return "$invariant_rc"
+        fi
+        printf 'provision-agent.sh: Unit 3 complete — allow[] written to platform settings and invariants verified\n'
+        return 0
+    fi
 
     # Step 0: Precondition checks (always run, including in --check mode)
     printf 'provision-agent.sh: [0/8] running precondition checks...\n'
@@ -990,6 +1400,10 @@ main() {
     # Step 6: Write systemd units (write + daemon-reload only; enable AFTER the probe — SC-2)
     printf 'provision-agent.sh: [6/8] writing systemd units...\n'
     write_units
+
+    # Step 6b: Unit 2 — install nft egress wall (HB-02; after write_units, before probe)
+    printf 'provision-agent.sh: [6b/8] installing nft egress wall (Unit 2)...\n'
+    unit2_install_egress_wall
 
     # Step 7: Defense-in-depth probe (final active step; runs BEFORE the timer is enabled)
     printf 'provision-agent.sh: [7/8] running defense-in-depth probe...\n'

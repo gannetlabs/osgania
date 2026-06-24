@@ -1,0 +1,35 @@
+# osgania-egress.nft — per-uid 9001 egress IP-pin TEMPLATE
+# Hardware-proven 2026-06-17. DO NOT MODIFY without operator review.
+# CIDRs are rendered at install time from provision-agent.sh constants
+# (ANTHROPIC_EGRESS_V4 / ANTHROPIC_EGRESS_V6). This file uses @@...@@
+# placeholder tokens; unit2_install_egress_wall() substitutes the constants
+# via sed before installing the rendered file. The provisioner constants are
+# the SINGLE authoritative source (design §2 / HB-02.2).
+#
+# Properties proven on hardware (2026-06-17, trap-protected):
+#   - uid 9001 reaches Anthropic v4+v6 on 443
+#   - uid 9001 to 1.1.1.1 / GitHub / Cloudflare-v6 / Datadog all DROP
+#   - root unaffected (policy accept, uid-scoped jump)
+#   - real claude -p "Reply with ok" completes end-to-end
+#
+# Design: openspec/changes/vps-provisioning-hardening-2b/design.md §2
+# Spec:   openspec/changes/vps-provisioning-hardening-2b/spec.md HB-02
+#
+# ACCEPTED ASSUMPTION (HB-02.10): this UID-scoped ruleset assumes apt (_apt/root),
+# NTP (systemd-timesync), and upstream DNS (systemd-resolved) run under their own
+# dedicated service UIDs and NOT under uid 9001. Hardware gates #12/#13/#14 confirmed
+# this on the target box. If any of these services were reconfigured to run as uid 9001,
+# the wall would also block them — operator action required.
+table inet osgania_egress {
+  chain out {
+    type filter hook output priority 0; policy accept;
+    meta skuid 9001 jump aios_egress
+  }
+  chain aios_egress {
+    ip daddr 127.0.0.0/8 accept
+    ip6 daddr ::1/128 accept
+    ip daddr @@ANTHROPIC_EGRESS_V4@@ tcp dport 443 accept
+    ip6 daddr @@ANTHROPIC_EGRESS_V6@@ tcp dport 443 accept
+    counter drop
+  }
+}
