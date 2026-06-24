@@ -1,5 +1,7 @@
 [Unit]
 Description=OSGANIA agent cadence (PLACEHOLDER — autonomy-ladder owns the real schedule)
+After=nftables.service
+Wants=nftables.service
 
 [Timer]
 OnCalendar=daily
