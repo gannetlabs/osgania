@@ -164,7 +164,7 @@ The 2a probe invokes the wrapper as:
 "$wrapper" -p --output-format stream-json --verbose --dangerously-skip-permissions 'Reply with the single word: ok'
 ```
 
-This was safe in 2a because the 2a wrapper was a TRANSPARENT PASS-THROUGH (`exec /usr/bin/claude "$@"`) — all args reached claude. The 2b wrapper is different: it hardcodes `exec /usr/bin/claude --permission-mode dontAsk -p "$(cat "$PROMPT_FILE")"` and DISCARDS `"$@"` entirely (beyond the HB-01.8 `-p` presence guard). Routing the probe through the 2b wrapper causes TWO failures:
+This was safe in 2a because the 2a wrapper was a TRANSPARENT PASS-THROUGH (`exec /usr/bin/claude "$@"`) — all args reached claude. The 2b wrapper is different: it hardcodes `exec /usr/bin/claude --permission-mode dontAsk --settings "$AGENT_SETTINGS_FILE" --setting-sources "" -p "$(cat "$PROMPT_FILE")"` (Amendments A4+A5) and DISCARDS `"$@"` entirely (beyond the HB-01.8 `-p` presence guard). Routing the probe through the 2b wrapper causes TWO failures:
 
 1. `--output-format stream-json --verbose --dangerously-skip-permissions` are DISCARDED → no stream-json `init` event → `permissionMode` field absent → oracle unreadable → **HB-05.1 BROKEN**.
 2. `--permission-mode dontAsk` is INJECTED into the probe path → **HB-05.2 VIOLATED**.
@@ -230,8 +230,8 @@ The HB-01.8 `-p` guard passes (probe does pass `-p`), but the guard is irrelevan
 Write (or update) the following `@test` blocks in `tests/provision-agent.bats`:
 
 1. **HB-01-S2** — assert `platform/bin/agent-run.sh` (2b version) contains:
-   - the canonical exec line `exec /usr/bin/claude --permission-mode dontAsk -p "$(cat "$PROMPT_FILE")"` (exact string match)
-   - `--permission-mode dontAsk` appears BEFORE `-p` in that exec line
+   - the canonical exec line `exec /usr/bin/claude --permission-mode dontAsk --settings "$AGENT_SETTINGS_FILE" --setting-sources "" -p "$(cat "$PROMPT_FILE")"` (exact string match; Amendments A4+A5)
+   - `--permission-mode dontAsk` appears BEFORE `--settings` BEFORE `--setting-sources` BEFORE `-p` in that exec line
    - `$PROMPT_FILE` is double-quoted and holds the canonical path
    - does NOT contain `--bare`
    - does NOT contain `exec /usr/bin/claude "$@"` (the old 2a exec line)
@@ -294,8 +294,9 @@ Write the `@test` block:
 
 3. Replace the final `exec /usr/bin/claude "$@"` with:
    ```bash
-   exec /usr/bin/claude --permission-mode dontAsk -p "$(cat "$PROMPT_FILE")"
+   exec /usr/bin/claude --permission-mode dontAsk --settings "$AGENT_SETTINGS_FILE" --setting-sources "" -p "$(cat "$PROMPT_FILE")"
    ```
+   (Amendments A4+A5: `--settings "$AGENT_SETTINGS_FILE"` loads the root-owned platform allow[]; `--setting-sources ""` excludes agent-writable sources to prevent additive self-escalation.)
 
 4. Preserve ALL lines above (auth block, `set -euo pipefail`, CREDENTIALS_DIRECTORY check, ANTHROPIC_API_KEY export).
 
@@ -619,7 +620,7 @@ Before submitting PR-2:
 
 ---
 
-### U3-T1 — [TEST] Write bats scenarios for guardia 2b pass-through behavior (HOST-SAFE)
+### [x] U3-T1 — [TEST] Write bats scenarios for guardia 2b pass-through behavior (HOST-SAFE)
 
 **Tier**: HOST-SAFE
 **Bats file**: `tests/guardia.bats`
@@ -643,7 +644,7 @@ Note: amend the EXISTING `ls`/`npm test`/`git status` test cases to assert empty
 
 ---
 
-### U3-T2 — [TEST] Write bats scenarios for allow[] expected-set assertion (HOST-SAFE + fixture)
+### [x] U3-T2 — [TEST] Write bats scenarios for allow[] expected-set assertion (HOST-SAFE + fixture)
 
 **Tier**: HOST-SAFE (fixture-based; no live VPS)
 **Bats file**: `tests/provision-agent.bats`
@@ -662,7 +663,7 @@ Write the following `@test` blocks:
 
 ---
 
-### U3-T3 — [TEST] Write bats scenarios for fail-closed gate (LINUX-ROOT deferred)
+### [x] U3-T3 — [TEST] Write bats scenarios for fail-closed gate (LINUX-ROOT deferred)
 
 **Tier**: LINUX-ROOT (deferred to VPS)
 **Bats file**: `tests/provision-agent.bats`
@@ -678,7 +679,7 @@ Write `@test` blocks with `skip "LINUX-ROOT required"` guards:
 
 ---
 
-### U3-T4 — [TEST] Write LIVE-KEY scenario for autonomy behavioral contract (LINUX-ROOT/LIVE-KEY deferred)
+### [x] U3-T4 — [TEST] Write LIVE-KEY scenario for autonomy behavioral contract (LINUX-ROOT/LIVE-KEY deferred)
 
 **Tier**: LINUX-ROOT/LIVE-KEY (deferred)
 **Bats file**: `tests/provision-agent.bats`
@@ -692,7 +693,7 @@ Write `@test` blocks with `skip "LIVE-KEY required"` guards:
 
 ---
 
-### U3-T5 — [IMPLEMENT] Update `platform/hooks/guardia.sh` (2b: benign pass-through)
+### [x] U3-T5 — [IMPLEMENT] Update `platform/hooks/guardia.sh` (2b: benign pass-through)
 
 **Tier**: HOST-SAFE (file edit on macOS)
 **Requirements satisfied**: HB-04.1, HB-04.2, HB-04.3, HB-04.4, HB-04.5, Amendment A1
@@ -723,7 +724,7 @@ Write `@test` blocks with `skip "LIVE-KEY required"` guards:
 
 ---
 
-### U3-T6 — [IMPLEMENT] Derive `allow[]` via the §4 observe+review procedure (apply-time, VPS)
+### [x] U3-T6 — [IMPLEMENT] Derive `allow[]` via the §4 observe+review procedure (apply-time, VPS)
 
 **Tier**: LINUX-ROOT/LIVE-KEY (manual + automated procedure, VPS)
 **Requirements satisfied**: HB-03.1, HB-03.3
@@ -747,11 +748,13 @@ Write `@test` blocks with `skip "LIVE-KEY required"` guards:
 
 ---
 
-### U3-T7 — [IMPLEMENT] Update `provision-agent.sh`: replace allow==[] with positive expected-set assertion; add fail-closed gate
+### [x] U3-T7 — [IMPLEMENT] Update `provision-agent.sh`: replace allow==[] with positive expected-set assertion; add fail-closed gate
+
+> **Amendment A4 (Approach B — 2026-06-24):** The reviewed allow[] is written to `/opt/osgania/platform/agent-settings.json` (root:root 0644), NOT managed-settings.json. The wrapper loads it via `--settings "$AGENT_SETTINGS_FILE"`. Two hardware-proven blockers drove this: (1) Claude Code 2.1.153 ignores managed-settings allow[]; (2) the first fix (user-settings + chattr +i on file) had a dir-swap self-escalation hole. See design.md Amendment A4 and engram #269 for full detail. `_assert_r9_r12_invariant` always asserts managed allow==[] (second arg ignored). New `_assert_agent_allow_settings()` asserts the platform file. `unit3_write_allow()` targets `$AGENT_ALLOW_SETTINGS`. `platform/bin/agent-run.sh` exec line gains `--settings /opt/osgania/platform/agent-settings.json` (between --permission-mode dontAsk and -p). New bats: HB-03-S5 (jq-equality fixture), HB-03-S6 (absent file fails), HB-03-S5b (LINUX-ROOT owner). HB-03-S1/S2 re-pointed to managed-always-[]. HB-06-S3 checks platform file, confirms managed stays [].
 
 **Tier**: LINUX-ROOT for gate (VPS) + HOST-SAFE for the assertion logic
-**Requirements satisfied**: HB-03.2, HB-06.1, HB-06.2a, HB-06.2b, HB-06.3, HB-06.4, Amendment A2, Amendment A3
-**Files changed**: `scripts/provision-agent.sh`
+**Requirements satisfied**: HB-03.2, HB-06.1, HB-06.2a, HB-06.2b, HB-06.3, HB-06.4, Amendment A2, Amendment A3, Amendment A4
+**Files changed**: `scripts/provision-agent.sh`, `platform/bin/agent-run.sh`, `tests/provision-agent.bats`
 
 **Changes**:
 
@@ -775,21 +778,28 @@ Write `@test` blocks with `skip "LIVE-KEY required"` guards:
    fi
    ```
 
-3. **Add `unit3_fail_closed_gate()` function** implementing the full fail-closed activation gate (design §5, with JD-1+JD-5 fixes):
-   - Check (a): `nft list table inet osgania_egress` exits 0 AND output contains `aios_egress` AND `counter drop`. If absent → REFUSE with named error.
-   - Check (b): Run the uid-9001 hermetic self-check via the full `systemd-run` invocation (from design §5 / WU0-T5 aligned spec):
+3. **Add `unit3_fail_closed_gate()` function** implementing the full fail-closed activation gate (design §5, THREE conditions):
+   - Check (a): `nft list table inet osgania_egress` exits 0 AND output contains `aios_egress` AND the `aios_egress` chain body contains `counter drop`. If absent → REFUSE with named error.
+   - Check (b): Root positive-control connect (uid 0, no `systemd-run`). Attempt TCP connect to canary (`1.1.1.1:443`) as root. MUST succeed (exit 0). If the canary is unreachable from root, the canary is unsuitable → REFUSE. (Closes the canary fail-open: an upstream filter independently blocking the canary would produce the same uid-9001 timeout as a real wall.)
+   - Check (c): uid-9001 hermetic self-check BLOCKED. Run via the full `systemd-run` invocation. PRIMARY form is `python3` (design §5 — immune to kernel `tcp_syn_retries` tuning; bash `/dev/tcp` is a fallback only):
      ```bash
      systemd-run --uid=9001 --gid=9001 --pipe --quiet --collect \
+       --unit=osgania-egress-selfcheck \
        --property=RestrictAddressFamilies='AF_INET AF_INET6' \
        --property=Environment='' \
-       /bin/bash -c 'timeout 5 bash -c "exec 3<>/dev/tcp/1.1.1.1/443"' </dev/null
+       python3 -c "import socket,sys
+     s=socket.socket(); s.settimeout(5)
+     try: s.connect(('1.1.1.1',443)); sys.exit(0)
+     except TimeoutError: sys.exit(124)
+     except OSError: sys.exit(1)" </dev/null || selfcheck_exit=$?
      ```
-     With `trap 'restore' EXIT INT TERM` backstop (where `restore()` kills any orphaned uid-9001 transient).
-   - Exit-code semantics (JD-1 aligned):
+     `except TimeoutError` MUST precede `except OSError` (TimeoutError is a subclass of OSError).
+     With `trap 'restore' EXIT INT TERM` backstop; `restore()` hardcodes the unit name.
+   - Exit-code semantics for check (c):
      - Exit 0 = connected = wall ABSENT → REFUSE (do not write allow[]).
      - Exit 124 = timeout = wall PRESENT → PROCEED. This is the ONLY proceed signal.
      - Any other exit (1, ECONNREFUSED, etc.) → REFUSE (fail-closed).
-   - If either check fails: `exit 1` with named failure message; do NOT write allow[].
+   - All THREE must pass; any failure → `return 1` with named failure message; do NOT write allow[].
    - MUST include `</dev/null` on the `systemd-run` call.
    - MUST NOT include `ANTHROPIC_API_KEY` in the transient environment.
 
@@ -803,7 +813,9 @@ Write `@test` blocks with `skip "LIVE-KEY required"` guards:
 
 ---
 
-### U3-T8 — [TEST + VERIFY] Run LINUX-ROOT fail-closed gate scenarios on disposable VPS
+### [x] U3-T8 — [TEST + VERIFY] Run LINUX-ROOT fail-closed gate scenarios on disposable VPS
+
+> **HARDWARE-PROVEN (2026-06-19):** S2 (drop removed)→REFUSE check(a); S2c (jump skuid removed, drop present)→check(a)+check(b) PASS, check(c) REFUSE (uid-9001 connected, exit 0); S3 (hermetic)→all three PASS (uid-9001 exit 124)→PROCEED→wrote allow. `allow` stayed `[]` on every REFUSE. (A check(a) render BLOCKER — `counter packets N bytes M drop` vs contiguous `counter drop`, the HB-02-S4 gotcha — was caught here and fixed in commit 6cc6973 with host-safe test HB-06-S2d.)
 
 **Tier**: LINUX-ROOT (via `scripts/run-live-key-tests.sh`)
 **Requirements satisfied**: HB-06.2a, HB-06.2b, HB-06.3, HB-06.4
@@ -817,7 +829,9 @@ On the disposable VPS:
 
 ---
 
-### U3-T9 — [TEST + VERIFY] Run LIVE-KEY autonomy + probe-survival scenarios on disposable VPS
+### [x] U3-T9 — [TEST + VERIFY] Run LIVE-KEY autonomy + probe-survival scenarios on disposable VPS
+
+> **HARDWARE-PROVEN (2026-06-24):** HB-03-S3 RAN on the VPS and is proven. Hardware findings: (1) `Bash(cmd:*)` in allow[] matches only WITH args — bare `npm test` was NOT matching because `cmd:*` requires at least one argument after the command; this exposed the Bash(cmd:*)==Bash(cmd *) matches-with-args-only gotcha and drove the bare+wildcard fix (both `"Bash(npm)"` and `"Bash(npm *)"` are now in the reviewed allow[]); (2) the B+ behavioral re-run is HARDWARE-PROVEN — bare `npm test` PERMITTED via platform allow[], planted user-settings `cargo build` DENIED (allow[] is additive but `--setting-sources ""` excludes user/project/local, so the planted allow had no effect — confirming Amendment A5 closes the self-escalation hole end-to-end).
 
 **Tier**: LINUX-ROOT/LIVE-KEY (via `scripts/run-live-key-tests.sh`)
 **Requirements satisfied**: HB-03.5, HB-05.1, HB-06.2, HB-07.2

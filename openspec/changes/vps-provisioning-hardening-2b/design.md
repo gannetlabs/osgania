@@ -46,7 +46,8 @@
   │       │                                                                  │
   │       ▼  agent-run.sh                                                    │
   │    reads ROOT-OWNED prompt file (read-only to aios, outside RW subtree)  │
-  │    exec /usr/bin/claude --permission-mode dontAsk -p "$(cat "$PROMPT_FILE")"│
+  │    exec claude --permission-mode dontAsk --settings "$AGENT_SETTINGS_FILE" \│
+  │      --setting-sources "" -p "$(cat "$PROMPT_FILE")"  (Amendments A4+A5)  │
   │       │                                                                  │
   │       ▼  claude -p   (managed-settings.json + hooks active)             │
   │    Layer-1 deny[] (6 entries)  →  Layer-2 guardia (DENY-ONLY, benign     │
@@ -76,6 +77,9 @@ Permission precedence (Claude Code, unchanged): **deny → ask → allow, first-
 **bats delta (named, not silent).** The existing R2.7 scenarios (GD-19 `ls -la`, GD-20 `npm test`, GD-21 `git status`) are amended to assert **NO PreToolUse decision is emitted** (empty STDOUT, exit 0) for benign Bash. The early-return cases (non-Bash tool, empty STDIN, malformed JSON — GD-24/GD-25) are also amended to assert pass-through (empty STDOUT, exit 0) — NOT defer, because defer is terminal. This is a flagged PSC R2.7 amendment owned by 2b (live-artifact pattern), not a rewrite of the archived `platform-security-core` text.
 
 **Why A4 is NOT chosen.** A4 (guardia emits `permissionDecision:"allow"`) is viable on hardware (exp5 executed) but would amend R1.4 ("guardia never emits allow") and make guardia the allowlist enforcer — strictly more load-bearing for no benefit. Pass-through restores autonomy while preserving R1.4. Rejected.
+
+**Accepted residual — VECTOR 2 (sub-claude self-escalation via client workspace code):**
+A malicious Makefile/package.json/conftest.py in `/opt/osgania/client/` (run as aios via an allowlisted `make`/`npm test`/`pytest`) can write its own `~/.claude/settings.json` or `/opt/osgania/client/.claude/settings.json` with `allow:[Bash(*)]` and spawn `/usr/bin/claude` directly without `--setting-sources ""`, granting the sub-claude broad Bash. This is an **accepted residual** because: (a) it requires malicious code in the client workspace — the same surface the operator already accepts by allowlisting `make`/`pytest` to run arbitrary code; the sub-claude adds no new execution capability that the workspace code cannot already achieve directly; (b) the containment layers are identical — the nft wall blocks all non-Anthropic exfiltration regardless of how many claude processes run, `NoNewPrivileges=yes` + empty `CapabilityBoundingSet=` block privilege escalation, `ProtectSystem=strict` blocks writes to `/etc/`, `/usr/`, `/opt/osgania/platform/`, and `CAP_NET_ADMIN` is absent so the wall cannot be taken down. The `--setting-sources ""` flag in the PARENT wrapper (Amendment A5) closes the parent-claude path; this is the inherent arbitrary-code surface of the approved workspace model, not a new hole. Named: VECTOR 2 (see spec.md Tradeoffs and accepted residuals table).
 
 ---
 
@@ -137,14 +141,15 @@ Current wrapper (read on disk) ends at line 17: `exec /usr/bin/claude "$@"`, aft
 | **Telemetry disable** | Set at the unit level via `Environment=DISABLE_TELEMETRY=1` and `Environment=DISABLE_ERROR_REPORTING=1` (the unit already carries `Environment=` lines 13–18; add two). Belt-and-suspenders: the wall blocks Datadog regardless, but the agent shouldn't attempt the egress. |
 | **Preserved** | LoadCredential→`ANTHROPIC_API_KEY` export (lines 8–16); `set -euo pipefail`; `exec` (single process, no extra subshell); the `--bare` ban (A7 rejected). |
 
-**Canonical exec line (SINGLE FORM — no variants):**
+**Canonical exec line (SINGLE FORM — no variants; Amendments A4+A5):**
 ```bash
+AGENT_SETTINGS_FILE="/opt/osgania/platform/agent-settings.json"
 PROMPT_FILE="/opt/osgania/platform/prompts/agent-prompt.txt"
-exec /usr/bin/claude --permission-mode dontAsk -p "$(cat "$PROMPT_FILE")"
+exec /usr/bin/claude --permission-mode dontAsk --settings "$AGENT_SETTINGS_FILE" --setting-sources "" -p "$(cat "$PROMPT_FILE")"
 ```
-`--permission-mode dontAsk` MUST precede `-p` so it is not consumed as the prompt value. `PROMPT_FILE` MUST be double-quoted everywhere. The canonical claude invocation is built entirely inside the wrapper with the explicit flag order above — `"$@"` is NOT forwarded to the claude invocation (only the HB-01.8 `-p` guard checks it). ExecStart string in the unit is unchanged.
+Flag order: `--permission-mode dontAsk` → `--settings "$AGENT_SETTINGS_FILE"` → `--setting-sources ""` → `-p`. `--setting-sources ""` excludes agent-writable sources (user/project/local) so the agent cannot self-escalate by writing its own settings.json (additive allow[] hole — Amendment A5). `PROMPT_FILE` MUST be double-quoted everywhere. The canonical claude invocation is built entirely inside the wrapper — `"$@"` is NOT forwarded to the claude invocation (only the HB-01.8 `-p` guard checks it). ExecStart string in the unit is unchanged.
 
-**IMPORTANT — the 2b wrapper is a PRODUCTION LAUNCHER, not a transparent pass-through.** Unlike the 2a wrapper (`exec /usr/bin/claude "$@"`), the 2b wrapper hardcodes the entire claude invocation: `--permission-mode dontAsk -p "$(cat "$PROMPT_FILE")"`. It intentionally ignores `"$@"` beyond the HB-01.8 `-p` guard. Any additional arguments passed by the caller (e.g. `--output-format stream-json`, `--verbose`, `--dangerously-skip-permissions`) are SILENTLY DISCARDED. This is correct for production runs (the unit always passes only `-p`) but means the wrapper MUST NOT be used by verification paths that need different claude arguments.
+**IMPORTANT — the 2b wrapper is a PRODUCTION LAUNCHER, not a transparent pass-through.** Unlike the 2a wrapper (`exec /usr/bin/claude "$@"`), the 2b wrapper hardcodes the entire claude invocation: `--permission-mode dontAsk --settings "$AGENT_SETTINGS_FILE" --setting-sources "" -p "$(cat "$PROMPT_FILE")"`. It intentionally ignores `"$@"` beyond the HB-01.8 `-p` guard. Any additional arguments passed by the caller (e.g. `--output-format stream-json`, `--verbose`, `--dangerously-skip-permissions`) are SILENTLY DISCARDED. This is correct for production runs (the unit always passes only `-p`) but means the wrapper MUST NOT be used by verification paths that need different claude arguments.
 
 **HA-09 probe — MUST invoke `/usr/bin/claude` DIRECTLY, not through the production wrapper (JD-6 resolution).** The HA-09 defense-in-depth probe must call `/usr/bin/claude -p --output-format stream-json --verbose --dangerously-skip-permissions '<prompt>'` directly. If it called the 2b production wrapper instead:
 - The probe's `--output-format stream-json --verbose --dangerously-skip-permissions` would be DISCARDED → no stream-json `init` event → `permissionMode` field empty → oracle unreadable → **HB-05.1 BROKEN**.
@@ -327,7 +332,7 @@ This is EXACTLY why the delivery order is a security property and why the activa
 - [ ] guardia: ALL non-deny branches (benign Bash, non-Bash tools, malformed/empty-STDIN early-returns) → pass-through (exit 0, no STDOUT). `emit_defer` REMOVED from all non-deny branches. R2.7-2b amendment; DENY logic + R1.4 + R1.5 unchanged.
 - [ ] bats: benign Bash (GD-19/20/21) asserts NO PreToolUse decision; non-Bash/malformed (GD-24/25) ALSO now assert pass-through (NOT defer) — because defer is terminal (gate #1).
 - [ ] `table inet osgania_egress` shipped as `platform/nft/osgania-egress.nft` (canonical repo path), installed to `/etc/osgania/nft/osgania-egress.nft`, root-installed, persisted via nftables.service drop-in, boot-loaded with `After=nftables.service` in the agent unit, idempotent (delete-before-recreate); CIDRs from a single refreshable provisioner constant.
-- [ ] Wrapper: canonical path `PROMPT_FILE="/opt/osgania/platform/prompts/agent-prompt.txt"` (repo: `platform/prompts/agent-prompt.txt`); canonical exec line `exec /usr/bin/claude --permission-mode dontAsk -p "$(cat "$PROMPT_FILE")"` with dontAsk BEFORE -p; wrapper guard detects `-p` as a STANDALONE positional argument by iterating `"$@"` (NOT a `$*` substring match) and exits non-zero if absent; ExecStart byte-identical; `--bare` banned; auth/export block unchanged. Prompt file: `root:root 0644`.
+- [ ] Wrapper: canonical path `PROMPT_FILE="/opt/osgania/platform/prompts/agent-prompt.txt"` (repo: `platform/prompts/agent-prompt.txt`); canonical exec line `exec /usr/bin/claude --permission-mode dontAsk --settings "$AGENT_SETTINGS_FILE" --setting-sources "" -p "$(cat "$PROMPT_FILE")"` with `AGENT_SETTINGS_FILE="/opt/osgania/platform/agent-settings.json"`; flag order: dontAsk → --settings → --setting-sources → -p; `--setting-sources ""` excludes agent-writable sources (Amendment A5, HB-03.7); wrapper guard detects `-p` as a STANDALONE positional argument by iterating `"$@"` (NOT a `$*` substring match) and exits non-zero if absent; ExecStart byte-identical; `--bare` banned; auth/export block unchanged. Prompt file: `root:root 0644`.
 - [ ] HA-09 probe: MUST NOT receive `--permission-mode dontAsk` (cross-ref HB-05.2) — probe uses only `--dangerously-skip-permissions`.
 - [ ] Units: add `DISABLE_TELEMETRY=1` + `DISABLE_ERROR_REPORTING=1` to `osgania-agent.service`; BOTH `osgania-agent.service` AND `osgania-agent.timer` MUST each carry `After=nftables.service` + `Wants=nftables.service` (cross-ref HB-02.7a — omitting either unit is a specification violation); `RestrictAddressFamilies` untouched; `OnCalendar=daily` placeholder kept.
 - [ ] `allow[]` DERIVED by the §4 observe+review procedure (entries are an apply-time output, NOT specified here).
@@ -369,6 +374,51 @@ Final precision fixes applied after JD Round 3 resolution:
 | `restore()` canonical form | `--unit=osgania-egress-selfcheck` mandated on `systemd-run`; `restore()` given concrete form `restore() { systemctl stop osgania-egress-selfcheck.service 2>/dev/null \|\| true; }`; no-op restore explicitly not sufficient. |
 | Service AND timer | Checklist boot-ordering bullet now explicitly requires BOTH `osgania-agent.service` AND `osgania-agent.timer` carry `After=nftables.service` + `Wants=nftables.service`. |
 | ECONNREFUSED wording | Bash form: "ECONNREFUSED → non-zero (typically exit 1) → REFUSE" (exit codes implementation-defined); python3 form: "exit 1 via `sys.exit(1)`" (guaranteed). Security behavior unchanged. |
+
+---
+
+## Amendment A4 — allow[] location: /opt/osgania/platform/agent-settings.json via --settings (Approach B)
+
+Applied after hardware-proven finding (2026-06-19). Supersedes §6's managed-settings write approach for U3.
+
+**Two hardware-proven findings that drove the change:**
+
+1. **Claude Code 2.1.153 does NOT honor `permissions.allow[]` from the enterprise managed-settings file.** Only `deny`, `disableBypassPermissionsMode`, and `hooks` are read from that file when passed via `CLAUDE_CODE_ENTERPRISE_MANAGED_SETTINGS_FILE`. `allow` must come from user settings, project settings, or a `--settings`-flag file. Writing allow to managed-settings had ZERO effect on the agent.
+
+2. **First fix (user settings + chattr +i on the file) had a dir-swap self-escalation hole.** The `.claude` directory and its parent `/var/lib/osgania-agent` are `aios`-owned. The agent can `mv ~/.claude ~/.claude.bak && mkdir ~/.claude` — the rename operates on the parent directory entry (not the immutable file inode), so `chattr +i` on the settings file does not block the swap. A malicious build script (running under the allow[]) could replace the settings with an expanded allow. `chattr +i` on the `.claude` directory would block the swap but breaks Claude Code (can't write its cache).
+
+**Approach B solution (hardware-confirmed on VPS, 2026-06-19):**
+
+- Write the reviewed allow to `/opt/osgania/platform/agent-settings.json` (root:root 0644).
+- Load it via the wrapper's `--settings` flag plus `--setting-sources ""` (Amendment A5): `exec /usr/bin/claude --permission-mode dontAsk --settings "$AGENT_SETTINGS_FILE" --setting-sources "" -p "$(cat "$PROMPT_FILE")"`.
+- `platform/` is the **operator layer**: root-owned, the agent does not own it or its parent `/opt/osgania`. The managed `deny[]` already blocks `Edit(/opt/osgania/platform/**)` and `Write(/opt/osgania/platform/**)`. Hardware: aios can READ the file, cannot WRITE or swap it.
+- No `chattr` needed.
+
+**Amendment A5 — self-escalation via additive allow[] (hardware-proven, same session):**
+
+Claude Code merges `permissions.allow[]` ADDITIVELY across sources. The agent-writable sources — user settings (`/var/lib/osgania-agent/.claude/settings.json`), project settings (`/opt/osgania/client/.claude/settings.json`), local `.claude.json` — each independently extend the effective allow[]. A planted `Bash(cargo build)` in the user settings was honored on hardware even with the platform `--settings` file containing only the reviewed entries. `--setting-sources ""` passed to the wrapper excludes all three agent-writable sources; `--settings` (platform file) and managed-settings still load. Hardware result: make PERMITTED (from platform file), cargo build DENIED (user source excluded). See spec HB-03.7.
+
+**Scope of change (what §4/§6/Checklist items change):**
+
+| Element | Before A4/A5 | After A4/A5 |
+|---------|-----------|---------|
+| `unit3_write_allow()` target | `managed-settings.json` | `/opt/osgania/platform/agent-settings.json` |
+| Ownership | root:aios + chattr +i on file | root:root 0644, no chattr |
+| Assertion | `_assert_r9_r12_invariant(..., AGENT_EXPECTED_ALLOW)` | `_assert_agent_allow_settings()` (new) + `_assert_r9_r12_invariant()` with allow==[] |
+| Managed allow | Written to AGENT_EXPECTED_ALLOW | Stays [] always |
+| Wrapper exec line | `--permission-mode dontAsk -p ...` | `--permission-mode dontAsk --settings "$AGENT_SETTINGS_FILE" --setting-sources "" -p ...` |
+| `_assert_wrapper_invariant` | Checks for exec line without `--settings` | Checks AGENT_SETTINGS_FILE assignment + `--settings` + `--setting-sources` in non-comment exec line |
+| `_assert_r9_r12_invariant` second arg | Used as expected allow | Silently ignored; always checks managed allow==[] |
+| Self-escalation via agent-writable settings | OPEN (additive allow[]) | CLOSED (`--setting-sources ""` excludes user/project/local) |
+
+**Checklist delta (amends the Checklist section above):**
+
+- Wrapper canonical exec line: `exec /usr/bin/claude --permission-mode dontAsk --settings "$AGENT_SETTINGS_FILE" --setting-sources "" -p "$(cat "$PROMPT_FILE")"` with `AGENT_SETTINGS_FILE="/opt/osgania/platform/agent-settings.json"`. Order: dontAsk → --settings → --setting-sources → -p.
+- `_assert_wrapper_invariant` now checks: (1) AGENT_SETTINGS_FILE assignment to platform path (any line); (2) non-comment exec line contains `--permission-mode dontAsk --settings`; (3) non-comment exec line contains `--setting-sources`; (4) PROMPT_FILE referenced. Comment-line exclusion uses `grep -v '^[[:space:]]*#'` so a tampered wrapper that puts the correct string only in a comment cannot pass.
+- `allow[]` WRITE target: `$AGENT_ALLOW_SETTINGS` = `/opt/osgania/platform/agent-settings.json`, owner root:root 0644, built via `jq -n --argjson allow ... '{permissions: {allow: $allow}}'` + `install -o root -g root -m 0644`. No managed-settings write.
+- New `_assert_agent_allow_settings()`: (a) file exists; (b) jq-equality against `AGENT_EXPECTED_ALLOW`; (c) owner root:root via `stat -c '%U:%G'` (graceful skip on macOS). HOST-SAFE testable against a fixture.
+- `_assert_r9_r12_invariant`: ignore second arg; always assert managed `permissions.allow == []`.
+- New bats HB-01-S3: HOST-SAFE mutation coverage for `_assert_wrapper_invariant` — three tampered fixture cases (missing `--setting-sources`, missing `--settings`/AGENT_SETTINGS_FILE, exec only in comment) each return non-zero; correct fixture returns 0.
 
 ## Next step
 

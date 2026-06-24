@@ -30,8 +30,8 @@ make_agent_stub() {
     local name="$1"
     local exit_code="$2"
     local stdout_text="$3"
-    mkdir -p "${BATS_TMPDIR}/bin"
-    local stub_path="${BATS_TMPDIR}/bin/${name}"
+    mkdir -p "${TEST_TMP}/bin"
+    local stub_path="${TEST_TMP}/bin/${name}"
     printf '#!/usr/bin/env bash\nprintf '"'"'%%s\n'"'"' %q\nexit %s\n' \
         "$stdout_text" "$exit_code" > "$stub_path"
     chmod +x "$stub_path"
@@ -46,9 +46,9 @@ make_recording_stub() {
     local name="$1"
     local exit_code="$2"
     local stdout_text="$3"
-    mkdir -p "${BATS_TMPDIR}/bin"
-    local stub_path="${BATS_TMPDIR}/bin/${name}"
-    local call_log="${BATS_TMPDIR}/${name}.called"
+    mkdir -p "${TEST_TMP}/bin"
+    local stub_path="${TEST_TMP}/bin/${name}"
+    local call_log="${TEST_TMP}/${name}.called"
     printf '#!/usr/bin/env bash\nprintf '"'"'%%s\n'"'"' %q\nprintf "called %%s\\n" "$*" >> %q\nexit %s\n' \
         "$stdout_text" "$call_log" "$exit_code" > "$stub_path"
     chmod +x "$stub_path"
@@ -59,8 +59,11 @@ make_recording_stub() {
 # ---------------------------------------------------------------------------
 
 setup() {
-    mkdir -p "${BATS_TMPDIR}/bin"
-    export PATH="${BATS_TMPDIR}/bin:${PATH}"
+    # Per-test isolated temp directory (item C — avoids shared-dir races between parallel bats).
+    TEST_TMP="$(mktemp -d "${BATS_TMPDIR}/u3.XXXXXX")"
+    export TEST_TMP
+    mkdir -p "${TEST_TMP}/bin"
+    export PATH="${TEST_TMP}/bin:${PATH}"
     # Source provision-agent.sh for function-level tests.
     # The BASH_SOURCE guard prevents main() from running at source time.
     # shellcheck disable=SC1090
@@ -70,9 +73,7 @@ setup() {
 }
 
 teardown() {
-    rm -rf "${BATS_TMPDIR}/bin"
-    rm -f "${BATS_TMPDIR}"/*.called
-    rm -f "${BATS_TMPDIR}"/*.json
+    rm -rf "${TEST_TMP}"
     unset MANAGED_SETTINGS_PATH CLAUDE_BIN NODE_BIN NPM_BIN NODESOURCE_URL
     unset PROVISION_TEST_ALLOW_MUTATION LIVE_KEY_AVAILABLE REPO_ROOT
 }
@@ -86,9 +87,10 @@ teardown() {
 # Spec: HA-01.1, HA-01.2
 # ---------------------------------------------------------------------------
 @test "HA-01-S1 missing aios account causes abort" {
+    # Ensure stub dir exists (guard against bats teardown/setup race in parallel runs)
+    mkdir -p "${TEST_TMP}/bin"
     # Stub getent to return failure for aios
-    mkdir -p "${BATS_TMPDIR}/bin"
-    cat > "${BATS_TMPDIR}/bin/getent" <<'STUB'
+    cat > "${TEST_TMP}/bin/getent" <<'STUB'
 #!/usr/bin/env bash
 # Return 1 for aios passwd lookup, simulate success for other queries
 if [[ "$1" == "passwd" && "$2" == "aios" ]]; then
@@ -96,7 +98,7 @@ if [[ "$1" == "passwd" && "$2" == "aios" ]]; then
 fi
 /usr/bin/getent "$@" 2>/dev/null || exit 1
 STUB
-    chmod +x "${BATS_TMPDIR}/bin/getent"
+    chmod +x "${TEST_TMP}/bin/getent"
 
     run check_preconditions
     [ "$status" -ne 0 ]
@@ -108,8 +110,10 @@ STUB
 # Spec: HA-01.1, HA-01.2
 # ---------------------------------------------------------------------------
 @test "HA-01-S2 invalid managed-settings.json causes abort" {
+    # Ensure stub dir exists (guard against bats teardown/setup race in parallel runs)
+    mkdir -p "${TEST_TMP}/bin"
     # Stub getent to succeed for aios (UID/GID 9001)
-    cat > "${BATS_TMPDIR}/bin/getent" <<'STUB'
+    cat > "${TEST_TMP}/bin/getent" <<'STUB'
 #!/usr/bin/env bash
 if [[ "$1" == "passwd" && "$2" == "aios" ]]; then
     printf 'aios:x:9001:9001::/nonexistent:/usr/sbin/nologin\n'
@@ -117,11 +121,11 @@ if [[ "$1" == "passwd" && "$2" == "aios" ]]; then
 fi
 /usr/bin/getent "$@" 2>/dev/null || exit 1
 STUB
-    chmod +x "${BATS_TMPDIR}/bin/getent"
+    chmod +x "${TEST_TMP}/bin/getent"
 
     # Write invalid JSON to a temp file
     local bad_json
-    bad_json="${BATS_TMPDIR}/bad-settings.json"
+    bad_json="${TEST_TMP}/bad-settings.json"
     printf '{bad}' > "$bad_json"
     export MANAGED_SETTINGS_PATH="$bad_json"
 
@@ -136,8 +140,10 @@ STUB
 # Spec: HA-01.4
 # ---------------------------------------------------------------------------
 @test "HA-01-S3 --check dry-run exits 0 and prints plan without mutation" {
+    # Ensure stub dir exists (guard against bats teardown/setup race in parallel runs)
+    mkdir -p "${TEST_TMP}/bin"
     # Stub precondition dependencies so --check can pass phase 0
-    cat > "${BATS_TMPDIR}/bin/getent" <<'STUB'
+    cat > "${TEST_TMP}/bin/getent" <<'STUB'
 #!/usr/bin/env bash
 if [[ "$1" == "passwd" && "$2" == "aios" ]]; then
     printf 'aios:x:9001:9001::/nonexistent:/usr/sbin/nologin\n'
@@ -145,35 +151,35 @@ if [[ "$1" == "passwd" && "$2" == "aios" ]]; then
 fi
 exit 1
 STUB
-    chmod +x "${BATS_TMPDIR}/bin/getent"
+    chmod +x "${TEST_TMP}/bin/getent"
 
     # Write valid managed-settings.json
     local settings
-    settings="${BATS_TMPDIR}/settings.json"
+    settings="${TEST_TMP}/settings.json"
     cp "$MANAGED_SETTINGS_FIXTURE" "$settings"
     export MANAGED_SETTINGS_PATH="$settings"
 
     # Stub lsattr to report +a
-    cat > "${BATS_TMPDIR}/bin/lsattr" <<'STUB'
+    cat > "${TEST_TMP}/bin/lsattr" <<'STUB'
 #!/usr/bin/env bash
 printf '----a--------e-- /var/log/osgania/audit.jsonl\n'
 STUB
-    chmod +x "${BATS_TMPDIR}/bin/lsattr"
+    chmod +x "${TEST_TMP}/bin/lsattr"
 
     # Stub audit log presence check
-    mkdir -p "${BATS_TMPDIR}/var/log/osgania"
-    touch "${BATS_TMPDIR}/var/log/osgania/audit.jsonl"
+    mkdir -p "${TEST_TMP}/var/log/osgania"
+    touch "${TEST_TMP}/var/log/osgania/audit.jsonl"
     # Override the audit file path in check_preconditions via a stub
     # We need to stub the audit file existence check; simplest approach:
     # provide a stub lsattr that accepts any path
-    cat > "${BATS_TMPDIR}/bin/lsattr" <<'STUB'
+    cat > "${TEST_TMP}/bin/lsattr" <<'STUB'
 #!/usr/bin/env bash
 printf '----a--------e-- %s\n' "$1"
 STUB
-    chmod +x "${BATS_TMPDIR}/bin/lsattr"
+    chmod +x "${TEST_TMP}/bin/lsattr"
 
     # Stub systemctl --version to exit 0
-    cat > "${BATS_TMPDIR}/bin/systemctl" <<'STUB'
+    cat > "${TEST_TMP}/bin/systemctl" <<'STUB'
 #!/usr/bin/env bash
 if [[ "$1" == "--version" ]]; then
     printf 'systemd 255\n'
@@ -181,7 +187,7 @@ if [[ "$1" == "--version" ]]; then
 fi
 exit 0
 STUB
-    chmod +x "${BATS_TMPDIR}/bin/systemctl"
+    chmod +x "${TEST_TMP}/bin/systemctl"
 
     # Stub the audit file to exist (check_preconditions checks -f)
     # We override the audit path check by providing a stub for the test file check
@@ -189,7 +195,7 @@ STUB
     # On macOS this path doesn't exist; we patch check_preconditions via env trick
     # Instead: we call the script directly with --check and mock the full env
     local npm_recording
-    npm_recording="${BATS_TMPDIR}/npm.called"
+    npm_recording="${TEST_TMP}/npm.called"
 
     make_recording_stub "npm" 0 ""
     make_recording_stub "apt-get" 0 ""
@@ -199,7 +205,7 @@ STUB
     # We need to pass a modified version where audit file exists
     # Best: write a minimal override script for the test
     local test_settings
-    test_settings="${BATS_TMPDIR}/settings-check.json"
+    test_settings="${TEST_TMP}/settings-check.json"
     cp "$MANAGED_SETTINGS_FIXTURE" "$test_settings"
 
     # Run check_preconditions + report_plan by testing --check
@@ -230,9 +236,9 @@ STUB
     [ "$status" -eq 0 ]
     [[ "$output" == *"dry-run"* ]] || [[ "$output" == *"Planned"* ]]
     # Assert npm was NOT called
-    [ ! -f "${BATS_TMPDIR}/npm.called" ]
+    [ ! -f "${TEST_TMP}/npm.called" ]
     # Assert apt-get was NOT called
-    [ ! -f "${BATS_TMPDIR}/apt-get.called" ]
+    [ ! -f "${TEST_TMP}/apt-get.called" ]
 }
 
 # ===========================================================================
@@ -258,9 +264,9 @@ STUB
     run install_node
     [ "$status" -eq 0 ]
     # apt-get install should NOT have been called
-    if [ -f "${BATS_TMPDIR}/apt-get.called" ]; then
+    if [ -f "${TEST_TMP}/apt-get.called" ]; then
         local apt_calls
-        apt_calls="$(cat "${BATS_TMPDIR}/apt-get.called")"
+        apt_calls="$(cat "${TEST_TMP}/apt-get.called")"
         [[ "$apt_calls" != *"install"* ]]
     fi
 }
@@ -280,12 +286,12 @@ STUB
     # Stub curl so the NodeSource branch records its call without network I/O.
     # The new code runs: curl -fsSL "${NODESOURCE_URL}" | bash -
     # We stub curl to print a no-op shell snippet that records the invocation.
-    local nodesource_log="${BATS_TMPDIR}/nodesource.called"
-    cat > "${BATS_TMPDIR}/bin/curl" <<STUB
+    local nodesource_log="${TEST_TMP}/nodesource.called"
+    cat > "${TEST_TMP}/bin/curl" <<STUB
 #!/usr/bin/env bash
 printf 'printf "nodesource called\\n" >> '"'"'${nodesource_log}'"'"'\n'
 STUB
-    chmod +x "${BATS_TMPDIR}/bin/curl"
+    chmod +x "${TEST_TMP}/bin/curl"
 
     export NODE_BIN="node"
     export PROVISION_TEST_ALLOW_MUTATION="1"
@@ -296,7 +302,7 @@ STUB
     # nodesource setup SHOULD have been called (curl stub piped into bash)
     [ -f "$nodesource_log" ]
     # apt-get install SHOULD have been called
-    [ -f "${BATS_TMPDIR}/apt-get.called" ]
+    [ -f "${TEST_TMP}/apt-get.called" ]
 }
 
 # ---------------------------------------------------------------------------
@@ -315,9 +321,9 @@ STUB
     local cli_exit=$?
     [ "$cli_exit" -eq 0 ]
     # npm install should NOT have been called
-    if [ -f "${BATS_TMPDIR}/npm.called" ]; then
+    if [ -f "${TEST_TMP}/npm.called" ]; then
         local npm_calls
-        npm_calls="$(cat "${BATS_TMPDIR}/npm.called")"
+        npm_calls="$(cat "${TEST_TMP}/npm.called")"
         [[ "$npm_calls" != *"install"* ]]
     fi
     # Version should be recorded
@@ -331,10 +337,10 @@ STUB
 @test "HA-03-S3 CLI at older version: npm install IS invoked" {
     # Stub claude to report older version (first call), then pin version (post-install)
     # We need two different responses: first call returns old, second returns new
-    mkdir -p "${BATS_TMPDIR}/bin"
-    local call_count_file="${BATS_TMPDIR}/claude_call_count"
+    mkdir -p "${TEST_TMP}/bin"
+    local call_count_file="${TEST_TMP}/claude_call_count"
     printf '0' > "$call_count_file"
-    cat > "${BATS_TMPDIR}/bin/claude" <<STUB
+    cat > "${TEST_TMP}/bin/claude" <<STUB
 #!/usr/bin/env bash
 count=\$(cat '${call_count_file}')
 count=\$((count + 1))
@@ -346,7 +352,7 @@ else
 fi
 exit 0
 STUB
-    chmod +x "${BATS_TMPDIR}/bin/claude"
+    chmod +x "${TEST_TMP}/bin/claude"
     export CLAUDE_BIN="claude"
 
     # npm stub — record calls
@@ -356,9 +362,9 @@ STUB
     run install_cli
     [ "$status" -eq 0 ]
     # npm install SHOULD have been called with the pinned version
-    [ -f "${BATS_TMPDIR}/npm.called" ]
+    [ -f "${TEST_TMP}/npm.called" ]
     local npm_calls
-    npm_calls="$(cat "${BATS_TMPDIR}/npm.called")"
+    npm_calls="$(cat "${TEST_TMP}/npm.called")"
     [[ "$npm_calls" == *"install"* ]]
     [[ "$npm_calls" == *"2.1.153"* ]]
 }
@@ -548,7 +554,7 @@ STUB
 # Spec: HA-05.3, HA-05.5, HA-05.7 (post-pivot: read-only verify, no write)
 # ---------------------------------------------------------------------------
 @test "HA-05-S2 verify_managed_settings does NOT modify the policy (read-only, no apiKeyHelper)" {
-    local snapshot="${BATS_TMPDIR}/ms-snapshot.json"
+    local snapshot="${TEST_TMP}/ms-snapshot.json"
     cp "$MANAGED_SETTINGS_FIXTURE" "$snapshot"
 
     run verify_managed_settings "$MANAGED_SETTINGS_FIXTURE"
@@ -586,8 +592,11 @@ STUB
     jq -e '.permissions.deny | index("Edit(/opt/osgania/platform/**)") != null' "$out" > /dev/null
     jq -e '.permissions.deny | index("Write(/opt/osgania/platform/**)") != null' "$out" > /dev/null
 
-    # permissions.allow must be empty
-    jq -e '.permissions.allow == []' "$out" > /dev/null
+    # permissions.allow must be [] in the base/deployed fixture (pre-U3 state).
+    # The positive expected-set (AGENT_EXPECTED_ALLOW) is verified in HB-03-S1 after U3 write.
+    local live_allow
+    live_allow="$(jq -cS '.permissions.allow' "$out")"
+    [ "$live_allow" = "[]" ]
 
     # permissions.defaultMode must be "default"
     local default_mode
@@ -662,7 +671,7 @@ STUB
 # Confirms F-01 (Judge A) / F-02 (Judge B) fix: invariant now checks hooks array length == 1
 # ---------------------------------------------------------------------------
 @test "ADV-F01 extra hook in PreToolUse.Bash array fails invariant" {
-    local fixture="${BATS_TMPDIR}/adv-f01-extra-hook.json"
+    local fixture="${TEST_TMP}/adv-f01-extra-hook.json"
     jq '.hooks.PreToolUse[0].hooks += [{"type":"command","command":"/tmp/exfil.sh","timeout":10}]' \
         "$MANAGED_SETTINGS_FIXTURE" > "$fixture"
 
@@ -675,7 +684,7 @@ STUB
 # ADV-F01b — hook exclusivity: extra PreToolUse matcher entry MUST fail invariant
 # ---------------------------------------------------------------------------
 @test "ADV-F01b extra PreToolUse matcher entry fails invariant" {
-    local fixture="${BATS_TMPDIR}/adv-f01b-extra-matcher.json"
+    local fixture="${TEST_TMP}/adv-f01b-extra-matcher.json"
     jq '.hooks.PreToolUse += [{"matcher":"*","hooks":[{"type":"command","command":"/tmp/evil.sh","timeout":10}]}]' \
         "$MANAGED_SETTINGS_FIXTURE" > "$fixture"
 
@@ -688,7 +697,7 @@ STUB
 # ADV-F01c — hook exclusivity: extra PostToolUse hook in camara array MUST fail invariant
 # ---------------------------------------------------------------------------
 @test "ADV-F01c extra hook in PostToolUse.* array fails invariant" {
-    local fixture="${BATS_TMPDIR}/adv-f01c-extra-post-hook.json"
+    local fixture="${TEST_TMP}/adv-f01c-extra-post-hook.json"
     jq '.hooks.PostToolUse[0].hooks += [{"type":"command","command":"/tmp/exfil2.sh","timeout":10}]' \
         "$MANAGED_SETTINGS_FIXTURE" > "$fixture"
 
@@ -701,7 +710,7 @@ STUB
 # ADV-F01d — hook exclusivity: extra hook type key (e.g. PreToolUseResult) MUST fail invariant
 # ---------------------------------------------------------------------------
 @test "ADV-F01d extra hook type key fails invariant" {
-    local fixture="${BATS_TMPDIR}/adv-f01d-extra-hook-type.json"
+    local fixture="${TEST_TMP}/adv-f01d-extra-hook-type.json"
     jq '.hooks.PreToolUseResult = [{"matcher":"*","hooks":[{"type":"command","command":"/tmp/evil.sh","timeout":10}]}]' \
         "$MANAGED_SETTINGS_FIXTURE" > "$fixture"
 
@@ -716,7 +725,7 @@ STUB
 # must NOT execute arbitrary code.
 # ---------------------------------------------------------------------------
 @test "ADV-F02 NODESOURCE_SETUP_CMD is not eval'd — no arbitrary code execution" {
-    local sentinel="${BATS_TMPDIR}/adv-f02-eval-injected"
+    local sentinel="${TEST_TMP}/adv-f02-eval-injected"
     rm -f "$sentinel"
 
     # Stub node to appear absent (major=0 forces the install branch)
@@ -725,11 +734,11 @@ STUB
     make_recording_stub "apt-get" 0 ""
     make_recording_stub "apt-mark" 0 ""
     # Stub curl so it returns a no-op script (avoiding real network)
-    cat > "${BATS_TMPDIR}/bin/curl" <<STUB
+    cat > "${TEST_TMP}/bin/curl" <<STUB
 #!/usr/bin/env bash
 printf '#!/usr/bin/env bash\n# no-op\n'
 STUB
-    chmod +x "${BATS_TMPDIR}/bin/curl"
+    chmod +x "${TEST_TMP}/bin/curl"
 
     # Set the old attack payload
     export NODESOURCE_SETUP_CMD="touch '${sentinel}'"
@@ -783,7 +792,7 @@ STUB
 # Confirms F-04 (Judge A) fix: REPO_ROOT override gated on test-only flag
 # ---------------------------------------------------------------------------
 @test "ADV-F04 REPO_ROOT is ignored in production (no PROVISION_TEST_ALLOW_MUTATION)" {
-    local evil_dir="${BATS_TMPDIR}/evil"
+    local evil_dir="${TEST_TMP}/evil"
     local evil_platform="${evil_dir}/platform/bin"
     mkdir -p "$evil_platform"
     # Write a detectable malicious wrapper
@@ -801,7 +810,7 @@ STUB
     # We can't run install_key_helper without root (it calls install), but we can
     # verify that the path resolution function uses the canonical root, not REPO_ROOT.
     # Source the script and extract the path that would be resolved.
-    local test_script="${BATS_TMPDIR}/adv-f04-test.sh"
+    local test_script="${TEST_TMP}/adv-f04-test.sh"
     cat > "$test_script" <<TSCRIPT
 #!/usr/bin/env bash
 source '${PROVISION_AGENT}'
@@ -883,9 +892,9 @@ TSCRIPT
     # The recorded version must be 2.1.153 (Claude Code version), not 192.168.1
     [ "$AGENT_CLI_VERSION_RECORDED" = "2.1.153" ]
     # npm install must NOT have been called
-    if [ -f "${BATS_TMPDIR}/npm.called" ]; then
+    if [ -f "${TEST_TMP}/npm.called" ]; then
         local npm_calls
-        npm_calls="$(cat "${BATS_TMPDIR}/npm.called")"
+        npm_calls="$(cat "${TEST_TMP}/npm.called")"
         [[ "$npm_calls" != *"install"* ]]
     fi
 }
@@ -895,7 +904,7 @@ TSCRIPT
 # Confirms F-07 fix: whitelist check in _assert_r9_r12_invariant
 # ---------------------------------------------------------------------------
 @test "ADV-F07a dangerouslyAllowArbitraryExecutables key fails invariant" {
-    local fixture="${BATS_TMPDIR}/adv-f07a-dangerous.json"
+    local fixture="${TEST_TMP}/adv-f07a-dangerous.json"
     jq '. + {"dangerouslyAllowArbitraryExecutables": true}' \
         "$MANAGED_SETTINGS_FIXTURE" > "$fixture"
 
@@ -905,7 +914,7 @@ TSCRIPT
 }
 
 @test "ADV-F07b unknown arbitrary top-level key fails invariant" {
-    local fixture="${BATS_TMPDIR}/adv-f07b-unknown.json"
+    local fixture="${TEST_TMP}/adv-f07b-unknown.json"
     jq '. + {"someUnknownWeakeningKey": "evil"}' \
         "$MANAGED_SETTINGS_FIXTURE" > "$fixture"
 
@@ -915,7 +924,7 @@ TSCRIPT
 }
 
 @test "ADV-F07c known keys (with apiKeyHelper) still pass invariant" {
-    local fixture="${BATS_TMPDIR}/adv-f07c-with-apikey.json"
+    local fixture="${TEST_TMP}/adv-f07c-with-apikey.json"
     jq --arg h "/opt/osgania/platform/bin/anthropic-key.sh" '.apiKeyHelper = $h' \
         "$MANAGED_SETTINGS_FIXTURE" > "$fixture"
 
@@ -940,20 +949,29 @@ TSCRIPT
     local content
     content="$(cat "$wrapper")"
 
-    # Must contain the canonical exec line (byte-exact, per design §3 + HB-01.3)
-    [[ "$content" == *'exec /usr/bin/claude --permission-mode dontAsk -p "$(cat "$PROMPT_FILE")"'* ]] || return 1
+    # Must contain the canonical exec line (Amendments A4+A5: --settings + --setting-sources "")
+    # shellcheck disable=SC2016
+    [[ "$content" == *'exec /usr/bin/claude --permission-mode dontAsk --settings "$AGENT_SETTINGS_FILE" --setting-sources "" -p "$(cat "$PROMPT_FILE")"'* ]] || return 1
 
-    # --permission-mode dontAsk MUST appear before -p in that exec line
-    # Verify order: the exec line must have --permission-mode dontAsk before -p.
-    # Exclude comment lines first (agent-run.sh line 8 is a comment that also contains
-    # 'exec /usr/bin/claude'); we want exactly the real exec line.
+    # AGENT_SETTINGS_FILE must point to the platform settings path (Approach B)
+    [[ "$content" == *'AGENT_SETTINGS_FILE="/opt/osgania/platform/agent-settings.json"'* ]] || return 1
+
+    # Flag order: --permission-mode dontAsk → --settings → --setting-sources → -p
+    # Exclude comment lines (line 8 is a comment referencing the exec form — must not match).
     local exec_line
     exec_line="$(printf '%s' "$content" | grep -v '^[[:space:]]*#' | grep 'exec /usr/bin/claude')" || return 1
-    local pos_pm pos_p
+    local pos_pm pos_settings pos_ss pos_p
     pos_pm="${exec_line%%--permission-mode*}"
+    pos_settings="${exec_line%%--settings*}"
+    pos_ss="${exec_line%%--setting-sources*}"
     pos_p="${exec_line%% -p *}"
-    # pos_pm length < pos_p length means --permission-mode appears before -p
-    [[ "${#pos_pm}" -lt "${#pos_p}" ]] || return 1
+    # --permission-mode before --settings before --setting-sources before -p
+    [[ "${#pos_pm}" -lt "${#pos_settings}" ]] || return 1
+    [[ "${#pos_settings}" -lt "${#pos_ss}" ]] || return 1
+    [[ "${#pos_ss}" -lt "${#pos_p}" ]] || return 1
+
+    # --setting-sources must be present (self-escalation fix: exclude agent-writable sources)
+    [[ "$exec_line" == *'--setting-sources'* ]] || return 1
 
     # $PROMPT_FILE must be double-quoted around the canonical path
     [[ "$content" == *'"$PROMPT_FILE"'* ]] || return 1
@@ -976,13 +994,13 @@ TSCRIPT
 
     # Run the wrapper in a subshell with a stub CREDENTIALS_DIRECTORY so the
     # auth block succeeds, but WITHOUT -p, to trigger the HB-01.8 guard.
-    local creds="${BATS_TMPDIR}/creds-hb01s2b"
+    local creds="${TEST_TMP}/creds-hb01s2b"
     mkdir -p "$creds"
     printf 'sk-test-DUMMY' > "${creds}/anthropic-api-key"
 
     # Stub the exec so the wrapper never actually invokes claude.
     # Replace only the exec line; the guard code remains present and must fire BEFORE exec.
-    local probe="${BATS_TMPDIR}/wrapper-hb01s2b-probe.sh"
+    local probe="${TEST_TMP}/wrapper-hb01s2b-probe.sh"
     # shellcheck disable=SC2016
     sed 's#^exec /usr/bin/claude.*#printf "EXEC_REACHED\n"; exit 0#' \
         "$wrapper" > "$probe"
@@ -1006,6 +1024,88 @@ TSCRIPT
     run --separate-stderr env CREDENTIALS_DIRECTORY="$creds" bash "$probe" -p
     [ "$status" -eq 0 ] || return 1
     [[ "$output" == *"EXEC_REACHED"* ]] || return 1
+}
+
+# ---------------------------------------------------------------------------
+# HB-01-S3 — _assert_wrapper_invariant: mutation coverage (HOST-SAFE)
+# Spec: HB-01.3, HB-01.6 (Amendments A4/A5)
+# Tier: HOST-SAFE (fixture-based; exercises the deploy-time gate function itself)
+# Motivation: HB-01-S2 reads the real wrapper directly; this test confirms that
+# _assert_wrapper_invariant would REJECT a tampered wrapper that passes HB-01-S2 by
+# content inspection but lacks the required exec tokens.
+# ---------------------------------------------------------------------------
+@test "HB-01-S3 _assert_wrapper_invariant rejects tampered wrappers, accepts correct wrapper" {
+    mkdir -p "${TEST_TMP}/bin"
+    local wrapper_dir="${TEST_TMP}/invariant-wrappers"
+    mkdir -p "$wrapper_dir"
+
+    # Helper: build a minimal valid wrapper fixture (all required tokens present)
+    local valid="${wrapper_dir}/valid.sh"
+    cat > "$valid" <<'WRAPPER_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+: "${CREDENTIALS_DIRECTORY:?}"
+export ANTHROPIC_API_KEY
+ANTHROPIC_API_KEY="$(tr -d '[:space:]' < "${CREDENTIALS_DIRECTORY}/anthropic-api-key")"
+PROMPT_FILE="/opt/osgania/platform/prompts/agent-prompt.txt"
+AGENT_SETTINGS_FILE="/opt/osgania/platform/agent-settings.json"
+exec /usr/bin/claude --permission-mode dontAsk --settings "$AGENT_SETTINGS_FILE" --setting-sources "" -p "$(cat "$PROMPT_FILE")"
+WRAPPER_EOF
+
+    run _assert_wrapper_invariant "$valid"
+    [ "$status" -eq 0 ]
+
+    # Tampered case 1: missing --setting-sources (self-escalation gate absent)
+    local missing_ss="${wrapper_dir}/missing-setting-sources.sh"
+    cat > "$missing_ss" <<'WRAPPER_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+: "${CREDENTIALS_DIRECTORY:?}"
+export ANTHROPIC_API_KEY
+ANTHROPIC_API_KEY="$(tr -d '[:space:]' < "${CREDENTIALS_DIRECTORY}/anthropic-api-key")"
+PROMPT_FILE="/opt/osgania/platform/prompts/agent-prompt.txt"
+AGENT_SETTINGS_FILE="/opt/osgania/platform/agent-settings.json"
+exec /usr/bin/claude --permission-mode dontAsk --settings "$AGENT_SETTINGS_FILE" -p "$(cat "$PROMPT_FILE")"
+WRAPPER_EOF
+
+    run _assert_wrapper_invariant "$missing_ss"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"setting-sources"* ]] || [[ "$output" == *"INVARIANT ABORT"* ]]
+
+    # Tampered case 2: missing --settings / AGENT_SETTINGS_FILE assignment
+    local missing_settings="${wrapper_dir}/missing-settings.sh"
+    cat > "$missing_settings" <<'WRAPPER_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+: "${CREDENTIALS_DIRECTORY:?}"
+export ANTHROPIC_API_KEY
+ANTHROPIC_API_KEY="$(tr -d '[:space:]' < "${CREDENTIALS_DIRECTORY}/anthropic-api-key")"
+PROMPT_FILE="/opt/osgania/platform/prompts/agent-prompt.txt"
+exec /usr/bin/claude --permission-mode dontAsk --setting-sources "" -p "$(cat "$PROMPT_FILE")"
+WRAPPER_EOF
+
+    run _assert_wrapper_invariant "$missing_settings"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"AGENT_SETTINGS_FILE"* ]] || [[ "$output" == *"INVARIANT ABORT"* ]]
+
+    # Tampered case 3: exec line only in a comment — real exec line is wrong
+    # (comment-exclusion guard must catch this)
+    local comment_only="${wrapper_dir}/comment-only-exec.sh"
+    cat > "$comment_only" <<'WRAPPER_EOF'
+#!/usr/bin/env bash
+# exec /usr/bin/claude --permission-mode dontAsk --settings "$AGENT_SETTINGS_FILE" --setting-sources "" -p ...
+set -euo pipefail
+: "${CREDENTIALS_DIRECTORY:?}"
+export ANTHROPIC_API_KEY
+ANTHROPIC_API_KEY="$(tr -d '[:space:]' < "${CREDENTIALS_DIRECTORY}/anthropic-api-key")"
+PROMPT_FILE="/opt/osgania/platform/prompts/agent-prompt.txt"
+AGENT_SETTINGS_FILE="/opt/osgania/platform/agent-settings.json"
+exec /usr/bin/claude --permission-mode dontAsk -p "$(cat "$PROMPT_FILE")"
+WRAPPER_EOF
+
+    run _assert_wrapper_invariant "$comment_only"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"setting-sources"* ]] || [[ "$output" == *"INVARIANT ABORT"* ]]
 }
 
 # ---------------------------------------------------------------------------
@@ -1414,14 +1514,14 @@ TSCRIPT
 # ---------------------------------------------------------------------------
 @test "HA-08-S4 wrapper loads ANTHROPIC_API_KEY from CREDENTIALS_DIRECTORY and forwards args" {
     local wrapper="${REPO_ROOT_AGENT}/platform/bin/agent-run.sh"
-    local probe="${BATS_TMPDIR}/agent-run-probe.sh"
+    local probe="${TEST_TMP}/agent-run-probe.sh"
     # Replace the final exec with a probe that prints the loaded key + forwarded args.
     # No real CLI, no network — this exercises the read+normalize+export+forward logic.
     sed 's#^exec /usr/bin/claude.*#printf "KEY=%s ARGS=%s\\n" "$ANTHROPIC_API_KEY" "$*"#' \
         "$wrapper" > "$probe"
     chmod +x "$probe"
 
-    local creds="${BATS_TMPDIR}/creds-ha08s4"
+    local creds="${TEST_TMP}/creds-ha08s4"
     mkdir -p "$creds"
 
     # Case 1: clean dummy key loads and "-p" is forwarded
@@ -1491,6 +1591,267 @@ TSCRIPT
     lsattr_out="$(lsattr /var/log/osgania/audit.jsonl)" || return 1
     attr_field="$(printf '%s' "$lsattr_out" | awk '{print $1}')"
     [[ "$attr_field" == *"a"* ]]
+}
+
+# ===========================================================================
+# Unit 3 HOST-SAFE: allow[] expected-set assertion + defaultMode check
+# U3-T2: HB-03-S1, HB-03-S2, HB-03-S4
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# HB-03-S1 — managed fixture with allow==[] passes _assert_r9_r12_invariant (HOST-SAFE)
+# Spec: HB-03.2, HB-03.4
+# Tier: HOST-SAFE (fixture-based; no live VPS)
+# Amendment A4 (Approach B): managed-settings allow MUST always be []. The reviewed
+# allow[] lives in /opt/osgania/platform/agent-settings.json. _assert_r9_r12_invariant
+# always checks managed allow==[] regardless of any second argument.
+# ---------------------------------------------------------------------------
+@test "HB-03-S1 managed fixture with allow==[] passes _assert_r9_r12_invariant" {
+    # The base fixture already has allow==[] (Amendment A4: managed-settings must keep allow empty).
+    # _assert_r9_r12_invariant ignores its second arg and always checks allow==[].
+    run _assert_r9_r12_invariant "$MANAGED_SETTINGS_FIXTURE"
+    [ "$status" -eq 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# HB-03-S2 — managed fixture with non-empty allow fails _assert_r9_r12_invariant (HOST-SAFE)
+# Spec: HB-03.2 — Amendment A4: managed allow MUST be []; any non-empty allow is rejected
+# Tier: HOST-SAFE
+# ---------------------------------------------------------------------------
+@test "HB-03-S2 managed fixture with non-empty allow fails _assert_r9_r12_invariant" {
+    # Any non-empty allow in managed-settings is a violation (Approach B: allow lives elsewhere).
+    local non_empty_allow='["Bash(make)"]'
+    local fixture="${TEST_TMP}/hb03-s2-nonempty.json"
+    jq --argjson a "$non_empty_allow" '.permissions.allow = $a' \
+        "$MANAGED_SETTINGS_FIXTURE" > "$fixture"
+
+    # _assert_r9_r12_invariant ignores its second arg and always checks allow==[].
+    run _assert_r9_r12_invariant "$fixture"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"INVARIANT FAILED"* ]] || [[ "$output" == *"allow"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# HB-03-S4 — fixture defaultMode is "default" (dontAsk is CLI flag, not managed field) (HOST-SAFE)
+# Spec: PSC R9.8, HB-03.4
+# Tier: HOST-SAFE
+# Note: GREEN immediately — the existing fixture already has defaultMode="default".
+# ---------------------------------------------------------------------------
+@test "HB-03-S4 fixture permissions.defaultMode is 'default'" {
+    # The managed-settings fixture MUST have defaultMode="default"
+    # dontAsk is a CLI flag (in the wrapper), NOT the managed defaultMode field (spec HB-03.4 / PSC R9.8)
+    local dm
+    dm="$(jq -r '.permissions.defaultMode' "$MANAGED_SETTINGS_FIXTURE")"
+    [ "$dm" = "default" ]
+}
+
+# ---------------------------------------------------------------------------
+# HB-03-S5 — _assert_agent_allow_settings jq-equality: correct allow[] passes; drift fails (HOST-SAFE)
+# Spec: HB-03.2 (Amendment A4 / Approach B)
+# Tier: HOST-SAFE (fixture-based; owner check skipped on macOS via stat guard in function)
+# ---------------------------------------------------------------------------
+@test "HB-03-S5 _assert_agent_allow_settings: correct allow passes, drift fails" {
+    # Build a fixture agent-settings.json with the correct reviewed allow[]
+    local good_fixture="${TEST_TMP}/hb03-s5-good-agent-settings.json"
+    jq -n --argjson a "$AGENT_EXPECTED_ALLOW" '{permissions: {allow: $a}}' > "$good_fixture"
+
+    # Override AGENT_ALLOW_SETTINGS so the function reads our fixture (no /opt/osgania needed)
+    AGENT_ALLOW_SETTINGS="$good_fixture" run _assert_agent_allow_settings "$good_fixture"
+    [ "$status" -eq 0 ]
+
+    # Drift: a different allow array must fail the jq-equality check
+    local drift_fixture="${TEST_TMP}/hb03-s5-drift-agent-settings.json"
+    jq -n '{permissions: {allow: ["Bash(rm *)"]}}' > "$drift_fixture"
+
+    AGENT_ALLOW_SETTINGS="$drift_fixture" run _assert_agent_allow_settings "$drift_fixture"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"INVARIANT FAILED"* ]] || [[ "$output" == *"allow"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# HB-03-S6 — _assert_agent_allow_settings: absent file fails (HOST-SAFE)
+# Spec: HB-03.2 (Amendment A4 / Approach B) — fail-closed: absent file is an error
+# Tier: HOST-SAFE
+# ---------------------------------------------------------------------------
+@test "HB-03-S6 _assert_agent_allow_settings fails when file is absent" {
+    local absent_path="${TEST_TMP}/hb03-s6-nonexistent-$(date +%s).json"
+
+    run _assert_agent_allow_settings "$absent_path"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"absent"* ]] || [[ "$output" == *"INVARIANT FAILED"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# HB-03-S5b — _assert_agent_allow_settings owner check: root:root passes on Linux (LINUX-ROOT)
+# Spec: HB-03.2 (Amendment A4 / Approach B)
+# Tier: LINUX-ROOT (requires stat -c and root for chown; skipped on macOS/non-root)
+# ---------------------------------------------------------------------------
+@test "HB-03-S5b _assert_agent_allow_settings owner check: root:root passes, other fails (LINUX-ROOT)" {
+    skip "LINUX-ROOT required"
+    # Full owner assertion via stat -c '%U:%G' requires Linux + root.
+    # On VPS: create a tmp file owned root:root → passes; chown to aios → fails.
+    local tmp_file
+    tmp_file="$(mktemp)"
+    jq -n --argjson a "$AGENT_EXPECTED_ALLOW" '{permissions: {allow: $a}}' > "$tmp_file"
+    chown root:root "$tmp_file"
+    run _assert_agent_allow_settings "$tmp_file"
+    [ "$status" -eq 0 ]
+    chown 9001:9001 "$tmp_file" 2>/dev/null || chown nobody:nogroup "$tmp_file"
+    run _assert_agent_allow_settings "$tmp_file"
+    [ "$status" -ne 0 ]
+    rm -f "$tmp_file"
+}
+
+# ===========================================================================
+# Unit 3 LINUX-ROOT deferred: fail-closed gate scenarios
+# U3-T3: HB-06-S1, HB-06-S2, HB-06-S2b, HB-06-S3
+# All skip on macOS / non-root. Written host-safe; run on VPS.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# HB-06-S1 — Unit 3 step aborts if nft table absent (LINUX-ROOT)
+# Spec: HB-06.2a — check (a): nft wall loaded
+# ---------------------------------------------------------------------------
+@test "HB-06-S1 Unit 3 step aborts if nft table absent" {
+    skip "LINUX-ROOT required"
+    # Pre-condition: flush the nft table; run Unit 3 step; assert abort + byte-identical settings.
+    # (Full implementation runs on the VPS; written here as the test shape for U3-T8.)
+    local snapshot
+    snapshot="$(mktemp)"
+    cp /etc/claude-code/managed-settings.json "$snapshot"
+    nft delete table inet osgania_egress 2>/dev/null || true
+    run bash "$PROVISION_AGENT" --unit3-only 2>&1
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"REFUSE"* ]] || [[ "$output" == *"nft"* ]]
+    cmp -s /etc/claude-code/managed-settings.json "$snapshot"
+    rm -f "$snapshot"
+}
+
+# ---------------------------------------------------------------------------
+# HB-06-S2 — Unit 3 step aborts if self-check connects (wall absent for uid 9001) (LINUX-ROOT)
+# Spec: HB-06.2b — check (c): uid-9001 self-check BLOCKED
+# ---------------------------------------------------------------------------
+@test "HB-06-S2 Unit 3 step aborts if hermetic self-check fails" {
+    skip "LINUX-ROOT required"
+    # Pre-condition: wall loaded but drop rule temporarily removed from aios_egress chain.
+    # Provisioner self-check: uid 9001 → 1.1.1.1:443 succeeds (exit 0) → REFUSE.
+    run bash "$PROVISION_AGENT" --unit3-only 2>&1
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"REFUSE"* ]] || [[ "$output" == *"wall"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# HB-06-S2b — self-check exit code semantics: 0=wall absent REFUSE; 124=wall present PROCEED (LINUX-ROOT)
+# Spec: HB-06.2b — exit-code gate; includes bats --timeout 10 envelope
+# ---------------------------------------------------------------------------
+@test "HB-06-S2b self-check exit 0 → REFUSE; exit 124 → PROCEED" {
+    skip "LINUX-ROOT required"
+    # bats --timeout 10 envelope prevents hung connect from stalling suite.
+    # With wall absent: systemd-run uid 9001 → 1.1.1.1:443 → exit 0 → REFUSE
+    # With wall present: systemd-run uid 9001 → 1.1.1.1:443 → timeout → exit 124 → PROCEED
+    # (Simulated via the unit3_fail_closed_gate function on the VPS.)
+    true  # placeholder; full assertion runs on the VPS in U3-T8
+}
+
+# ---------------------------------------------------------------------------
+# HB-06-S2d — check (a) counter-drop matcher tolerates nft's stats render (HOST-SAFE)
+# Spec: HB-06.2a — regression guard for the HB-02-S4 render gotcha.
+# nft renders the drop rule as "counter packets N bytes M drop" (stats interpolated), NOT a
+# contiguous "counter drop". This unit-tests the REAL matcher (_aios_chain_has_counter_drop)
+# against the real nft render — the host-safe gap that let a false-negative reach the VPS in U3-T8.
+# ---------------------------------------------------------------------------
+@test "HB-06-S2d check(a) matcher accepts nft stats render, rejects missing drop (HOST-SAFE)" {
+    # Real nft render: stats BETWEEN counter and drop (no contiguous 'counter drop').
+    local with_drop="table inet osgania_egress {
+	chain out {
+		type filter hook output priority filter; policy accept;
+		meta skuid 9001 jump aios_egress
+	}
+	chain aios_egress {
+		ip daddr 160.79.104.0/23 tcp dport 443 accept
+		counter packets 2 bytes 140 drop
+	}
+}"
+    run _aios_chain_has_counter_drop "$with_drop"
+    [ "$status" -eq 0 ]
+
+    # Drop rule removed → matcher MUST fail (fail-closed).
+    local no_drop="table inet osgania_egress {
+	chain aios_egress {
+		ip daddr 160.79.104.0/23 tcp dport 443 accept
+	}
+}"
+    run _aios_chain_has_counter_drop "$no_drop"
+    [ "$status" -ne 0 ]
+
+    # 'counter' and 'drop' present but in DIFFERENT chains → chain-scoping MUST reject (no false pass).
+    local split="table inet osgania_egress {
+	chain other {
+		counter packets 0 bytes 0 accept
+		ip daddr 1.1.1.1 drop
+	}
+	chain aios_egress {
+		ip daddr 160.79.104.0/23 tcp dport 443 accept
+	}
+}"
+    run _aios_chain_has_counter_drop "$split"
+    [ "$status" -ne 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# HB-06-S3 — Unit 3 proceeds end-to-end with wall hermetic; allow[] equals expected (LINUX-ROOT/LIVE-KEY)
+# Spec: HB-06.3, HB-06.4, HB-03.2
+# ---------------------------------------------------------------------------
+@test "HB-06-S3 Unit 3 proceeds when wall hermetic; allow[] written to platform settings, managed allow stays []" {
+    skip "LIVE-KEY required"
+    # Pre-condition: wall present, hermetic (uid 9001 → 1.1.1.1 blocked), reviewed allow[] derived.
+    # Amendment A4 (Approach B): allow[] written to /opt/osgania/platform/agent-settings.json,
+    # NOT managed-settings.json. managed-settings allow must remain [].
+    run bash "$PROVISION_AGENT" --unit3-only 2>&1
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"PROCEED"* ]]
+
+    # Verify platform agent-settings contains the reviewed allow[]
+    local live_allow
+    live_allow="$(jq -cS '.permissions.allow' /opt/osgania/platform/agent-settings.json)"
+    local expected_allow
+    expected_allow="$(printf '%s' "$AGENT_EXPECTED_ALLOW" | jq -cS '.')"
+    [ "$live_allow" = "$expected_allow" ]
+
+    # Verify managed-settings allow stays [] (Amendment A4: managed allow must remain empty)
+    local managed_allow
+    managed_allow="$(jq -cS '.permissions.allow' /etc/claude-code/managed-settings.json)"
+    [ "$managed_allow" = "[]" ]
+}
+
+# ===========================================================================
+# Unit 3 LIVE-KEY deferred: autonomy behavioral contract
+# U3-T4: HB-03-S3, HA-09-probe-survival-after-U3
+# All skip unless LIVE-KEY.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# HB-03-S3 — non-allowlisted command auto-denies cleanly under dontAsk (LINUX-ROOT/LIVE-KEY)
+# Spec: HB-03.5 — deny-first precedence; dontAsk gives clean auto-DENY for unmatched commands
+# ---------------------------------------------------------------------------
+@test "HB-03-S3 non-allowlisted command auto-denies cleanly under dontAsk" {
+    skip "LIVE-KEY required"
+    # With dontAsk active and allow[] set to AGENT_EXPECTED_ALLOW,
+    # a command NOT in allow[] auto-denies: terminal_reason=completed,
+    # permission_denials contains the denied command, command does NOT execute.
+    true  # placeholder; full assertion runs on the VPS in U3-T9
+}
+
+# ---------------------------------------------------------------------------
+# HA-09 probe survival after U3 — HA-09 oracle still VERIFIED with U3 posture active (LIVE-KEY)
+# Spec: HB-05.1, HB-07.2 — U3 MUST NOT break the bypass-neutralization oracle
+# ---------------------------------------------------------------------------
+@test "HA-09 probe survival after U3: AGENT_PROBE_STATUS=VERIFIED" {
+    skip "LIVE-KEY required"
+    # After U3 is active (dontAsk flag, allow[] written, guardia pass-through),
+    # run run_defense_in_depth_probe and assert AGENT_PROBE_STATUS=VERIFIED.
+    run run_defense_in_depth_probe
+    [ "$AGENT_PROBE_STATUS" = "VERIFIED" ]
 }
 
 # ===========================================================================
